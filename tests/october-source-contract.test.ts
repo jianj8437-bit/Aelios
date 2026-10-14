@@ -1035,3 +1035,35 @@ test("Dream transcripts name Gu Chen apart from her and from Xu Heng", async () 
   assert.match(transcript, /\[他\] 合成：他说好/);
   assert.match(nameOnlyRule(speakers!), /标为「第三人」的话是他说的/);
 });
+
+test("Xu Heng's judge is careful with changes and boundaries and leaves people's cards alone", async () => {
+  const { octoberApproveMin, listOctoberCandidatesToJudge, runCandidateJudge } = await import("../src/memory/candidateJudge");
+  assert.equal(octoberApproveMin("add", "event", 0.8), 0.8);
+  assert.equal(octoberApproveMin("add", "boundary", 0.8), 0.9);
+  assert.equal(octoberApproveMin("update", "event", 0.8), 0.9);
+  assert.equal(octoberApproveMin("delete", "fact", 0.95), 0.95);
+
+  const { sqlite, env } = setup();
+  const source = await sourceEvent({ ...firstInput, source_id: "synthetic/judge-source" });
+  assert.equal((await ingest(env, source)).response.status, 200);
+  const messageId = (sqlite.prepare("SELECT message_id FROM october_source_ledger").get() as any).message_id;
+  const insert = sqlite.prepare(`INSERT INTO memory_candidates (id, namespace, type, content, confidence, importance, tags,
+      source_message_ids, source, status, decision_note, created_at, updated_at)
+    VALUES (?, 'xu-heng', 'event', ?, 0.7, 0.5, '[]', ?, ?, 'pending', ?, '2026-01-03T00:00:00Z', '2026-01-03T00:00:00Z')`);
+  insert.run("c-dream", "合成候选一", JSON.stringify([messageId]), "dream_add", null);
+  insert.run("c-judged", "合成候选二", JSON.stringify([messageId]), "dream_add", "judge: 拿不准");
+  insert.run("c-migrated", "合成候选三", JSON.stringify([messageId]), "migration:lmc5-review", "migrated_from_lmc5_review");
+  const due = await listOctoberCandidatesToJudge(env.DB, OCTOBER_NAMESPACE, 20);
+  assert.deepEqual(due.map((row) => row.id), ["c-dream"]);
+
+  const off = await runCandidateJudge(env, OCTOBER_NAMESPACE);
+  assert.equal(off.ran, false);
+  assert.equal(off.reason, "october_source_contract_requires_human_review");
+});
+
+test("the October nightly stays off until the private config turns it on", async () => {
+  const { env } = setup();
+  let scheduled = 0;
+  await worker.scheduled({ cron: "10 20 * * *" } as any, env, { waitUntil: () => { scheduled += 1; } } as any);
+  assert.equal(scheduled, 0);
+});

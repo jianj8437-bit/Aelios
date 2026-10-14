@@ -20,6 +20,8 @@ import { extractJsonObject } from "../utils/parse";
 import { createVectorMemory } from "./vectorStore";
 import { formatSpeakerTranscript, judgeSpeakerRules, loadSpeakersForNamespace, type DreamSpeakers } from "./speakers";
 import { isOctoberContractEnabled } from "../october/contract";
+import { reviewOctoberCandidate } from "../october/store";
+import { nowIso } from "../utils/time";
 
 // listMemoryCandidates 本身按 confidence ASC 排序，正好是"先看最没把握的"，直接复用，
 // 不用再为 judge 单独建一个查询。
@@ -327,11 +329,116 @@ async function approveCandidate(
   return created.id;
 }
 
+// Xu Heng under the October contract (SPEC B6): Dream's candidates may settle themselves, but changing or
+// archiving what he already remembers, and anything about boundaries, needs a higher score than a plain new
+// memory. Migrated LMC-5 review cards and anything the judge already looked at stay for a person.
+const OCTOBER_JUDGED_SOURCES = ["dream_add", "dream_update", "dream_delete"];
+const OCTOBER_CAREFUL_MIN = 0.9;
+
+export function octoberApproveMin(kind: JudgeKind, type: string, base: number): number {
+  if (kind !== "add" || type === "boundary") return Math.max(base, OCTOBER_CAREFUL_MIN);
+  return base;
+}
+
+export async function listOctoberCandidatesToJudge(db: D1Database, namespace: string, limit: number): Promise<MemoryCandidateRow[]> {
+  const result = await db
+    .prepare(
+      `SELECT * FROM memory_candidates
+       WHERE namespace = ? AND status = 'pending'
+         AND source IN (${OCTOBER_JUDGED_SOURCES.map(() => "?").join(", ")})
+         AND (decision_note IS NULL OR decision_note NOT LIKE 'judge:%')
+       ORDER BY created_at ASC, id ASC
+       LIMIT ?`
+    )
+    .bind(namespace, ...OCTOBER_JUDGED_SOURCES, limit)
+    .all<MemoryCandidateRow>();
+  return result.results ?? [];
+}
+
+async function runOctoberCandidateJudge(
+  env: Env,
+  namespace: string,
+  input: { model: string; limit: number; approveMin: number; discardMax: number }
+): Promise<JudgeRunResult> {
+  const candidates = await listOctoberCandidatesToJudge(env.DB, namespace, input.limit);
+  if (candidates.length === 0) {
+    return { ran: true, judged: 0, approved: 0, discarded: 0, kept: 0, failed: 0, model: input.model, reason: "no_candidates" };
+  }
+  const speakers = await loadSpeakersForNamespace(env, namespace);
+  let judged = 0;
+  let approved = 0;
+  let discarded = 0;
+  let kept = 0;
+  let failed = 0;
+  for (const candidate of candidates) {
+    try {
+      const sourceMessageIds = parseJsonArray(candidate.source_message_ids);
+      const messages = sourceMessageIds.length > 0
+        ? await getMessagesByIds(env.DB, { namespace, ids: sourceMessageIds })
+        : [];
+      let judgeResult: JudgeModelResult;
+      if (messages.length === 0) {
+        judgeResult = { score: 0, grounded: false, durable: false, shouldDelete: null, reason: "没有可核对的原始消息，无法确认是否有据" };
+      } else {
+        const modelResult = await callJudgeModel(env, input.model, buildJudgePrompt(candidate, messages, speakers), { id: candidate.id });
+        if (!modelResult) {
+          failed += 1;
+          continue;
+        }
+        judgeResult = modelResult;
+      }
+      judged += 1;
+      const kind = judgeKindFor(candidate.source);
+      const decision = decideJudge(kind, judgeResult, {
+        approveMin: octoberApproveMin(kind, candidate.type, input.approveMin),
+        discardMax: input.discardMax
+      });
+      const decisionNote = `judge: ${judgeResult.reason}`;
+      if (decision === "keep") {
+        await env.DB
+          .prepare(
+            `UPDATE memory_candidates SET decision_note = ?, updated_at = ?
+             WHERE namespace = ? AND id = ? AND status = 'pending'`
+          )
+          .bind(decisionNote, nowIso(), namespace, candidate.id)
+          .run();
+        kept += 1;
+        continue;
+      }
+      await reviewOctoberCandidate(env, {
+        decisionId: `judge-${candidate.id}`,
+        candidateId: candidate.id,
+        action: decision,
+        decisionNote
+      });
+      if (decision === "approve") approved += 1;
+      else discarded += 1;
+    } catch (error) {
+      failed += 1;
+      console.error("october candidate judge: failed", {
+        id: candidate.id,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+  return { ran: true, judged, approved, discarded, kept, failed, model: input.model };
+}
+
 export async function runCandidateJudge(
   env: Env,
   namespace: string,
   options: { limit?: number } = {}
 ): Promise<JudgeRunResult> {
+  if (isOctoberContractEnabled(env) && env.OCTOBER_XH_JUDGE === "on") {
+    const model = readModelName(env, ["JUDGE_MODEL", "DREAM_MODEL"], "");
+    if (!model) return { ran: false, judged: 0, approved: 0, discarded: 0, kept: 0, failed: 0, reason: "missing_model" };
+    return runOctoberCandidateJudge(env, namespace, {
+      model,
+      limit: readPositiveInt(options.limit ?? env.JUDGE_MAX_CANDIDATES, DEFAULT_MAX_CANDIDATES, MAX_CANDIDATES_CAP),
+      approveMin: Math.max(readUnitFloat(env.JUDGE_APPROVE_MIN, DEFAULT_APPROVE_MIN), DEFAULT_APPROVE_MIN),
+      discardMax: readUnitFloat(env.JUDGE_DISCARD_MAX, DEFAULT_DISCARD_MAX)
+    });
+  }
   if (isOctoberContractEnabled(env)) {
     return {
       ran: false,

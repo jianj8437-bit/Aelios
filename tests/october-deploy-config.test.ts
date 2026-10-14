@@ -100,3 +100,22 @@ test("writes mode 0600 outside the repository and never overwrites", () => {
     rmSync(temp, { recursive: true, force: true });
   }
 });
+
+test("the nightly Dream needs names, carries exactly its cron and switches, and stays off by default", () => {
+  const plain = renderOctoberXhConfig(upstream, D1_ID, SOURCE_CODE_URL);
+  assert.doesNotMatch(plain, /^\[triggers\]$/m);
+  assert.doesNotMatch(plain, /^OCTOBER_XH_(?:NIGHTLY|JUDGE|USER_NAME)\s*=/m);
+
+  const names = { user: "合成甲", assistant: "合成乙", guChen: "合成丙" };
+  assert.throws(() => renderOctoberXhConfig(upstream, D1_ID, SOURCE_CODE_URL, "src/index.ts", "migrations", { nightly: true }),
+    /needs names/);
+  const nightly = renderOctoberXhConfig(upstream, D1_ID, SOURCE_CODE_URL, "src/index.ts", "migrations",
+    { names, nightly: true, judge: true });
+  assert.equal(nightly.match(/^\[triggers\]$/gm)?.length, 1);
+  assert.equal(nightly.match(/^crons = \["10 20 \* \* \*"\]$/gm)?.length, 1);
+  assert.match(nightly, /^OCTOBER_XH_NIGHTLY = "on"$/m);
+  assert.match(nightly, /^OCTOBER_XH_JUDGE = "on"$/m);
+  assert.match(nightly, /^OCTOBER_XH_GU_CHEN_NAME = "合成丙"$/m);
+  assert.throws(() => renderOctoberXhConfig(upstream, D1_ID, SOURCE_CODE_URL, "src/index.ts", "migrations",
+    { names: { ...names, user: 'bad"name' } }), /plain characters/);
+});

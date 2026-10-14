@@ -32,6 +32,10 @@ export interface Env {
   OCTOBER_XH_USER_NAME?: string;
   OCTOBER_XH_ASSISTANT_NAME?: string;
   OCTOBER_XH_GU_CHEN_NAME?: string;
+  /** "on" runs Xu Heng's nightly Dream under the October contract; anything else keeps it off. */
+  OCTOBER_XH_NIGHTLY?: string;
+  /** "on" lets the candidate judge settle Xu Heng's Dream candidates; anything else leaves them pending. */
+  OCTOBER_XH_JUDGE?: string;
   CF_AIG_TOKEN?: string;
   ENABLE_DREAM?: string;
   // --- Aelios 记忆库 v2 行为开关 ---

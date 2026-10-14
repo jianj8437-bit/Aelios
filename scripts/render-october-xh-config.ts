@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -13,6 +13,25 @@ export const OCTOBER_XH_RESOURCES = Object.freeze({
 
 export const OCTOBER_XH_CONTRACT = "october-xh-source-v1";
 export const OCTOBER_XH_QUEUE_MAX_RETRIES = 3;
+/** Xu Heng's nightly Dream: 20:10 UTC = 04:10 Asia/Singapore, after his day is over. */
+export const OCTOBER_XH_NIGHTLY_CRON = "10 20 * * *";
+
+/**
+ * What only the private deployment decides: the names his transcripts use, and whether the nightly Dream and
+ * the candidate judge run. All default to off/absent, which keeps the isolated release exactly as before.
+ */
+export interface OctoberXhDreamSettings {
+  names?: { user: string; assistant: string; guChen: string };
+  nightly?: boolean;
+  judge?: boolean;
+}
+
+function checkedName(value: unknown, field: string): string {
+  if (typeof value !== "string" || !value.trim() || value.trim().length > 32 || /["\\\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error(`dream names.${field} must be 1-32 plain characters`);
+  }
+  return value.trim();
+}
 
 const D1_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SOURCE_CODE_URL = /^https:\/\/github\.com\/jianj8437-bit\/Aelios\/tree\/[0-9a-f]{40}$/;
@@ -61,7 +80,8 @@ function assertRenderedConfig(
   d1Id: string,
   entrypoint: string,
   migrationsDir: string,
-  sourceCodeUrl: string
+  sourceCodeUrl: string,
+  dream: OctoberXhDreamSettings = {}
 ) {
   const requiredLines = [
     `main = "${entrypoint}"`,
@@ -86,7 +106,12 @@ function assertRenderedConfig(
       throw new Error(`rendered config is missing or duplicates: ${line}`);
     }
   }
-  if (source.includes("[triggers]") || /^crons\s*=/m.test(source)) {
+  if (dream.nightly) {
+    if (countLine(source, /^\[triggers\]$/) !== 1 || source.split("\n").filter((line) => line === `crons = ["${OCTOBER_XH_NIGHTLY_CRON}"]`).length !== 1 ||
+        countLine(source, /^crons\s*=/) !== 1 || countLine(source, /^OCTOBER_XH_NIGHTLY = "on"$/) !== 1) {
+      throw new Error("the nightly config must carry exactly the Xu Heng nightly cron and its switch");
+    }
+  } else if (source.includes("[triggers]") || /^crons\s*=/m.test(source) || /^OCTOBER_XH_NIGHTLY\s*=/m.test(source)) {
     throw new Error("October Xu Heng config must not enable cron triggers");
   }
   if (source.includes('name = "companion-memory-proxy"') ||
@@ -108,7 +133,8 @@ export function renderOctoberXhConfig(
   d1Id: string,
   sourceCodeUrl: string,
   entrypoint = "src/index.ts",
-  migrationsDir = "migrations"
+  migrationsDir = "migrations",
+  dream: OctoberXhDreamSettings = {}
 ) {
   if (!D1_ID.test(d1Id)) throw new Error("--d1-id must be a Cloudflare D1 UUID");
   if (!SOURCE_CODE_URL.test(sourceCodeUrl)) {
@@ -162,8 +188,19 @@ export function renderOctoberXhConfig(
   rendered = upsertVar(rendered, "MEMORY_LIFECYCLE_ENABLED", "true");
   rendered = upsertVar(rendered, "RECALL_REQUIRE_D1_BACKING", "true");
   rendered = upsertVar(rendered, "CANDIDATE_JUDGE_ENABLED", "false");
+  if (dream.names) {
+    rendered = upsertVar(rendered, "OCTOBER_XH_USER_NAME", checkedName(dream.names.user, "user"));
+    rendered = upsertVar(rendered, "OCTOBER_XH_ASSISTANT_NAME", checkedName(dream.names.assistant, "assistant"));
+    rendered = upsertVar(rendered, "OCTOBER_XH_GU_CHEN_NAME", checkedName(dream.names.guChen, "guChen"));
+  }
+  if (dream.judge) rendered = upsertVar(rendered, "OCTOBER_XH_JUDGE", "on");
+  if (dream.nightly) {
+    if (!dream.names) throw new Error("the nightly Dream needs names, or Gu Chen's words would read as hers");
+    rendered = upsertVar(rendered, "OCTOBER_XH_NIGHTLY", "on");
+    rendered = `${rendered.trimEnd()}\n\n[triggers]\ncrons = ["${OCTOBER_XH_NIGHTLY_CRON}"]\n`;
+  }
   rendered = `${rendered.trimEnd()}\n`;
-  assertRenderedConfig(rendered, d1Id, entrypoint, migrationsDir, sourceCodeUrl);
+  assertRenderedConfig(rendered, d1Id, entrypoint, migrationsDir, sourceCodeUrl, dream);
   return rendered;
 }
 
@@ -172,7 +209,8 @@ export function writeOctoberXhConfig(
   outputPath: string,
   d1Id: string,
   sourceCodeUrl: string,
-  repositoryRoot: string
+  repositoryRoot: string,
+  dream: OctoberXhDreamSettings = {}
 ) {
   if (!isAbsolute(outputPath)) throw new Error("--out must be an absolute path outside the repository");
   const resolvedRoot = resolve(repositoryRoot);
@@ -186,7 +224,8 @@ export function writeOctoberXhConfig(
     d1Id,
     sourceCodeUrl,
     resolve(resolvedRoot, "src/index.ts"),
-    resolve(resolvedRoot, "migrations")
+    resolve(resolvedRoot, "migrations"),
+    dream
   );
   writeFileSync(resolvedOutput, rendered, { encoding: "utf8", flag: "wx", mode: 0o600 });
   chmodSync(resolvedOutput, 0o600);
@@ -194,8 +233,30 @@ export function writeOctoberXhConfig(
     output: resolvedOutput,
     sha256: createHash("sha256").update(rendered).digest("hex"),
     resources: OCTOBER_XH_RESOURCES,
-    cron: "disabled",
+    cron: dream.nightly ? OCTOBER_XH_NIGHTLY_CRON : "disabled",
+    judge: dream.judge ? "on" : "off",
     secretsRendered: false
+  };
+}
+
+function optionalOption(args: string[], name: string) {
+  const index = args.indexOf(name);
+  if (index < 0) return null;
+  if (!args[index + 1]) throw new Error(`missing value for ${name}`);
+  return args[index + 1];
+}
+
+/** The private settings file: {"names": {...}, "nightly": bool, "judge": bool}; absolute path, owner-only. */
+function readDreamSettings(path: string | null): OctoberXhDreamSettings {
+  if (!path) return {};
+  if (!isAbsolute(path)) throw new Error("--dream must be an absolute path");
+  if ((statSync(path).mode & 0o077) !== 0) throw new Error("--dream file must be readable by its owner only");
+  const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+  const names = raw.names as Record<string, unknown> | undefined;
+  return {
+    names: names ? { user: String(names.user ?? ""), assistant: String(names.assistant ?? ""), guChen: String(names.guChen ?? "") } : undefined,
+    nightly: raw.nightly === true,
+    judge: raw.judge === true
   };
 }
 
@@ -214,7 +275,8 @@ if (import.meta.url === invokedPath) {
       option(process.argv.slice(2), "--out"),
       option(process.argv.slice(2), "--d1-id"),
       option(process.argv.slice(2), "--source-code-url"),
-      root
+      root,
+      readDreamSettings(optionalOption(process.argv.slice(2), "--dream"))
     );
     console.log(JSON.stringify(result, null, 2));
   } catch (error) {

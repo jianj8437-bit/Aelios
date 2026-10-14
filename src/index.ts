@@ -53,7 +53,7 @@ import {
   handleOctoberReconcile,
   handleOctoberSourceEvent
 } from "./api/october";
-import { isOctoberContractEnabled } from "./october/contract";
+import { isOctoberContractEnabled, OCTOBER_NAMESPACE } from "./october/contract";
 import { handleOctoberSourceOffer, withOctoberSourceOffer } from "./october/sourceOffer";
 
 const DAILY_MAINTENANCE_CRON = "10 20 * * *";
@@ -320,7 +320,11 @@ export default {
 
   async scheduled(controller: ScheduledController, deployed: Env, ctx: ExecutionContext): Promise<void> {
     const env = applySettings(deployed, await loadSettings(deployed));
-    if (isOctoberContractEnabled(env)) {
+    // Under the October contract only Xu Heng's own namespace is maintained, and only once the private
+    // deployment config turns it on. Retention and the GitHub daily pull never run for him: his originals
+    // live in October, and nothing here belongs to another project.
+    const october = isOctoberContractEnabled(env);
+    if (october && env.OCTOBER_XH_NIGHTLY !== "on") {
       console.log("october source contract scheduled maintenance disabled", { cron: controller.cron });
       return;
     }
@@ -334,9 +338,10 @@ export default {
 
     ctx.waitUntil(
       (async () => {
-        const config = await loadConfig(env);
-        const namespaces = [...new Set([getDailyDigestNamespace(env),
-          ...config.identities.filter(i => i.models.length).map(i => identityNamespace(i))])];
+        const namespaces = october
+          ? [OCTOBER_NAMESPACE]
+          : await loadConfig(env).then((config) => [...new Set([getDailyDigestNamespace(env),
+            ...config.identities.filter(i => i.models.length).map(i => identityNamespace(i))])]);
         for (const namespace of namespaces) {
           try {
             const results: unknown[] = [];
@@ -366,7 +371,9 @@ export default {
             }
             results.push({ type: "diary_writer", result: diaryWriter ?? { ok: false } });
 
-            const [retentionResult, githubResult] = await Promise.all([
+            const [retentionResult, githubResult] = october
+              ? [{ skipped: "october" }, { skipped: "october" }]
+              : await Promise.all([
               runMemoryRetention(env, namespace).then(
                 (retention) => ({ ok: true as const, retention }),
                 (error) => {
