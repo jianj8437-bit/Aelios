@@ -18,6 +18,7 @@ import {
   recordDreamReviewProposal,
   sanitizeDreamDigestLists
 } from "./judgePhase";
+import { isOctoberContractEnabled } from "../../october/contract";
 
 /** supersede / archive / upsert / candidate queue + daily log write */
 export async function applyDreamV2(
@@ -40,7 +41,9 @@ export async function applyDreamV2(
   errors: Array<{ target_id: string; reason: string }>;
 }> {
   const { namespace, strategy, dateLabel, digest, messageIds, extracted } = input;
-  const isReview = strategy === "review";
+  // The isolated Xu Heng contract never lets Dream mutate active memory
+  // directly. Every model result remains a pending review candidate.
+  const isReview = strategy === "review" || isOctoberContractEnabled(env);
   let updated = 0;
   const deleted = 0;
   let queuedCandidates = 0;

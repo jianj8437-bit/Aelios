@@ -40,5 +40,13 @@ export const KEY_PROFILES = {
     allowModelPassthrough: false,
     debug: false,
     chooseNamespace: false
+  },
+  octoberAdmin: {
+    source: "october-xh-admin",
+    namespace: "xu-heng",
+    scopes: ["memory:read", "memory:write", "export:read", "debug:read"],
+    allowModelPassthrough: false,
+    debug: true,
+    chooseNamespace: false
   }
 } satisfies Record<string, KeyProfile>;

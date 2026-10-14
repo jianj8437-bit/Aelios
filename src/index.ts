@@ -43,6 +43,17 @@ import { runMemoryRetention } from "./memory/retention";
 import { handleQueueMessage } from "./queue/consumer";
 import type { Env, QueueMessage } from "./types";
 import { openAiError } from "./utils/json";
+import {
+  handleOctoberBoot,
+  handleOctoberCandidateReview,
+  handleOctoberDerivedList,
+  handleOctoberDiary,
+  handleOctoberMigration,
+  handleOctoberRecall,
+  handleOctoberReconcile,
+  handleOctoberSourceEvent
+} from "./api/october";
+import { isOctoberContractEnabled } from "./october/contract";
 
 const DAILY_MAINTENANCE_CRON = "10 20 * * *";
 
@@ -100,6 +111,54 @@ export default {
     if (request.method === "GET" && url.pathname === "/api/gateway/recalls") return handleRecallHistory(request, deployed);
 
     const env = applySettings(deployed, await loadSettings(deployed));
+
+    // The isolated October worker has a deliberately small service surface.
+    // This allowlist prevents an admin/runtime key from reaching Aelios' chat
+    // proxy, generic ingest, MCP active writes, or direct-memory promotion and
+    // bypassing the source/review contract.
+    if (isOctoberContractEnabled(env)) {
+      if (request.method === "GET" && url.pathname === "/health") return handleHealth(env);
+      if (url.pathname === "/v1/october/source-events") {
+        return handleOctoberSourceEvent(request, env);
+      }
+      if (url.pathname === "/v1/memory/recall") {
+        return handleOctoberRecall(request, env);
+      }
+      if (url.pathname === "/v1/memory_boot") {
+        return handleOctoberBoot(request, env);
+      }
+      if (url.pathname === "/v1/diary" || url.pathname === "/v1/diary/recent") {
+        return handleOctoberDiary(request, env);
+      }
+      if (url.pathname === "/v1/precious") {
+        return handleOctoberDerivedList(request, env, "precious");
+      }
+      if (url.pathname === "/v1/glossary") {
+        return handleOctoberDerivedList(request, env, "glossary");
+      }
+      if (url.pathname === "/v1/longtail") {
+        return handleOctoberDerivedList(request, env, "longtail");
+      }
+      if (url.pathname === "/v1/october/reconcile") {
+        return handleOctoberReconcile(request, env);
+      }
+      if (url.pathname === "/v1/october/migrations" || url.pathname.startsWith("/v1/october/migrations/")) {
+        return handleOctoberMigration(request, env);
+      }
+      if (url.pathname.startsWith("/v1/october/candidates/")) {
+        return handleOctoberCandidateReview(request, env);
+      }
+      if (url.pathname === "/v1/candidates" && request.method === "GET") {
+        return handleMemoryCandidates(request, env);
+      }
+      if (url.pathname === "/v1/dream/status" && request.method === "GET") {
+        return handleDreamStatus(request, env);
+      }
+      if (url.pathname === "/v1/dream/run" && request.method === "POST") {
+        return handleDreamRun(request, env);
+      }
+      return openAiError("Not found", 404);
+    }
 
     if (
       request.method === "POST" &&
@@ -235,6 +294,13 @@ export default {
 
   async queue(batch: MessageBatch<QueueMessage>, deployed: Env): Promise<void> {
     const env = applySettings(deployed, await loadSettings(deployed));
+    if (isOctoberContractEnabled(env)) {
+      console.log("october source contract queue disabled", { messages: batch.messages.length });
+      // Preserve unexpected messages for operator review. An isolated worker
+      // must not acknowledge and discard work from a mistakenly shared queue.
+      for (const message of batch.messages) message.retry();
+      return;
+    }
     for (const message of batch.messages) {
       try {
         await handleQueueMessage(message.body, env);
@@ -248,6 +314,10 @@ export default {
 
   async scheduled(controller: ScheduledController, deployed: Env, ctx: ExecutionContext): Promise<void> {
     const env = applySettings(deployed, await loadSettings(deployed));
+    if (isOctoberContractEnabled(env)) {
+      console.log("october source contract scheduled maintenance disabled", { cron: controller.cron });
+      return;
+    }
     const cron = controller.cron;
     const shouldRunDailyMaintenance = !cron || cron === DAILY_MAINTENANCE_CRON;
 

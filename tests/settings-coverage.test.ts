@@ -27,6 +27,7 @@ const INTERNAL: Record<string, string> = {
   MEMORY_QUEUE: 'queue binding',
   VECTORIZE: 'Vectorize binding',
   GATEWAY_CONFIG: '内部 JSON blob（/admin 的配置本体），不是开关',
+  OCTOBER_XH_SOURCE_CONTRACT: '部署时钉死的隔离合同版本；故意不允许从 /admin 动态开启',
   AI_GATEWAY_BASE_URL: '/admin 的上游地址优先，这个只是 Worker var 兜底',
   CLOUDFLARE_ACCOUNT_ID: '同上：上游地址里的账户 ID 优先',
   DAILY_DIGEST_MODEL: 'readDreamModel 的旧名兜底，前面有 DREAM_MODEL',

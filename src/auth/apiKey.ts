@@ -44,5 +44,9 @@ export async function authenticate(request: Request, env: Env): Promise<AuthResu
     return { ok: true, profile: KEY_PROFILES.guideDog, keyName: "GUIDE_DOG_API_KEY" };
   }
 
+  if (env.OCTOBER_XH_ADMIN_API_KEY && timingSafeEqualStr(token, env.OCTOBER_XH_ADMIN_API_KEY)) {
+    return { ok: true, profile: KEY_PROFILES.octoberAdmin, keyName: "OCTOBER_XH_ADMIN_API_KEY" };
+  }
+
   return { ok: false };
 }

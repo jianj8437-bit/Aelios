@@ -78,7 +78,8 @@ CANDIDATE_JUDGE_ENABLED = "true"
 
 # Private/account-specific variables live in the Cloudflare Dashboard:
 # AI_GATEWAY_BASE_URL, CHATBOX_API_KEY, MEMORY_MCP_API_KEY,
-# GUIDE_DOG_API_KEY, CF_AIG_TOKEN.
+# GUIDE_DOG_API_KEY, CF_AIG_TOKEN. The isolated October Xu Heng deployment also
+# pins OCTOBER_XH_SOURCE_CONTRACT and stores both OCTOBER_XH_*_API_KEY values as Secrets.
 # D1 binding is auto-filled by `npm run setup:cloudflare`.
 
 [[vectorize]]

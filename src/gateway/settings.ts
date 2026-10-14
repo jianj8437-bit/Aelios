@@ -84,6 +84,8 @@ export const SECRET_SPECS: { name: string; label: string }[] = [
   { name: "DEBUG_API_KEY", label: "维护密钥（跨记忆空间操作）" },
   { name: "MEMORY_MCP_API_KEY", label: "MCP 密钥" },
   { name: "GUIDE_DOG_API_KEY", label: "导盲犬密钥" },
+  { name: "OCTOBER_XH_SOURCE_API_KEY", label: "十月许珩权威源密钥" },
+  { name: "OCTOBER_XH_ADMIN_API_KEY", label: "十月许珩人工复核密钥" },
   { name: "CLOUDFLARE_API_TOKEN", label: "CF 令牌（网关上游就靠它，一把管所有）" },
   { name: "CF_AIG_TOKEN", label: "AI Gateway 认证令牌（网关开了 authenticated gateway 才要）" },
   { name: "GITHUB_DAILY_TOKEN", label: "GitHub 日档只读 PAT" }

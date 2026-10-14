@@ -19,6 +19,7 @@ import type { Env, MessageRecord } from "../types";
 import { extractJsonObject } from "../utils/parse";
 import { createVectorMemory } from "./vectorStore";
 import { formatSpeakerTranscript, judgeSpeakerRules, loadSpeakersForNamespace, type DreamSpeakers } from "./speakers";
+import { isOctoberContractEnabled } from "../october/contract";
 
 // listMemoryCandidates 本身按 confidence ASC 排序，正好是"先看最没把握的"，直接复用，
 // 不用再为 judge 单独建一个查询。
@@ -37,7 +38,7 @@ export interface JudgeRunResult {
   kept: number;
   failed: number;
   model?: string;
-  reason?: "judge_disabled" | "missing_model" | "no_candidates";
+  reason?: "judge_disabled" | "october_source_contract_requires_human_review" | "missing_model" | "no_candidates";
 }
 
 function readPositiveInt(value: unknown, fallback: number, max: number): number {
@@ -331,6 +332,17 @@ export async function runCandidateJudge(
   namespace: string,
   options: { limit?: number } = {}
 ): Promise<JudgeRunResult> {
+  if (isOctoberContractEnabled(env)) {
+    return {
+      ran: false,
+      judged: 0,
+      approved: 0,
+      discarded: 0,
+      kept: 0,
+      failed: 0,
+      reason: "october_source_contract_requires_human_review"
+    };
+  }
   if (env.CANDIDATE_JUDGE_ENABLED === "false") {
     return { ran: false, judged: 0, approved: 0, discarded: 0, kept: 0, failed: 0, reason: "judge_disabled" };
   }

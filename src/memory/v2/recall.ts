@@ -36,6 +36,7 @@ import { getYesterdayDateLabel } from "../dreamDates";
 import { readDreamTimeZone } from "../dreamEnv";
 import { formatDateLabel } from "../../utils/time";
 import type { Env, PerceptionCacheItem } from "../../types";
+import { isOctoberContractEnabled } from "../../october/contract";
 
 // --- 开关 ---
 
@@ -186,7 +187,7 @@ export interface BootPackage {
     max_chars: number;
   };
   precious: Array<{ id: string; content: string; created_at: string }>;
-  glossary: Array<{ term: string; definition: string; aliases: string[] }>;
+  glossary: Array<{ id: string; term: string; definition: string; aliases: string[] }>;
   // LMC-5: spontaneous perception (SessionStart). Absent/empty = do not inject section.
   spontaneous?: PerceptionCacheItem[];
   schema_version: string;
@@ -203,7 +204,7 @@ export async function buildBootPackage(
   env: Env,
   input: { namespace: string; preciousRows?: PreciousRow[] }
 ): Promise<BootPackage> {
-  const cached = bootPackageCache.get(input.namespace);
+  const cached = isOctoberContractEnabled(env) ? undefined : bootPackageCache.get(input.namespace);
   if (cached && cached.expiresAt > Date.now()) {
     return cached.value;
   }
@@ -264,10 +265,12 @@ export async function buildBootPackage(
     cache_prefix_end: true
   };
 
-  bootPackageCache.set(input.namespace, {
-    expiresAt: Date.now() + BOOT_CACHE_TTL_MS,
-    value: pkg
-  });
+  if (!isOctoberContractEnabled(env)) {
+    bootPackageCache.set(input.namespace, {
+      expiresAt: Date.now() + BOOT_CACHE_TTL_MS,
+      value: pkg
+    });
+  }
   return pkg;
 }
 
@@ -283,7 +286,7 @@ async function buildCoreFingerprintFromDb(
 async function listAllGlossary(
   env: Env,
   namespace: string
-): Promise<Array<{ term: string; definition: string; aliases: string[] }>> {
+): Promise<Array<{ id: string; term: string; definition: string; aliases: string[] }>> {
   const rows = await listGlossary(env.DB, { namespace });
   return rows
     .map((r) => {
@@ -294,7 +297,7 @@ async function listAllGlossary(
       } catch {
         aliases = [];
       }
-      return { term: r.term, definition: r.definition, aliases };
+      return { id: r.id, term: r.term, definition: r.definition, aliases };
     })
     .sort((a, b) => a.term.localeCompare(b.term));
 }
@@ -375,7 +378,7 @@ export interface RecallWeekBlock {
 
 export interface RecallResult {
   hits: RecallHit[];
-  glossary_hits: Array<{ term: string; definition: string }>;
+  glossary_hits: Array<{ id: string; term: string; definition: string }>;
   week_blocks: RecallWeekBlock[];
   meta: {
     decayed_ids: string[];
@@ -418,7 +421,7 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
     namespace: input.namespace,
     query: glossaryQuery
   });
-  const glossaryHits = glossaryRows.map((r) => ({ term: r.term, definition: r.definition }));
+  const glossaryHits = glossaryRows.map((r) => ({ id: r.id, term: r.term, definition: r.definition }));
 
   // 2. memories 混合召回 (向量 + 词面 RRF，L4 + L6 world_fact，active only)
   //    闸一: 不查 precious。precious 归 boot 固定供给, 不进每轮 query 召回池。

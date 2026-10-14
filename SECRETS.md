@@ -16,12 +16,15 @@ Cloudflare Worker 的「Variables and Secrets」面板里，**Variable** 是明�
 | `CHATBOX_API_KEY` | **Secret** | 客户端和管理面板的访问密钥 |
 | `MEMORY_MCP_API_KEY` | **Secret** | 纯记忆库 MCP 的访问密钥（可选） |
 | `GUIDE_DOG_API_KEY` | **Secret** | 导盲犬 API 的访问密钥（可选） |
+| `OCTOBER_XH_SOURCE_API_KEY` | **Secret** | 十月许珩隔离实例的权威源写入与只读召回密钥（仅该实例） |
+| `OCTOBER_XH_ADMIN_API_KEY` | **Secret** | 十月许珩隔离实例的人工复核与修复密钥（仅管理员持有） |
 | `IM_API_KEY` | **Secret** | 第二把钥匙，IM bot 用（可选） |
 | `DEBUG_API_KEY` | **Secret** | 调试接口钥匙（可选） |
 | `CF_AIG_TOKEN` | **Secret** | AI Gateway 调用 token（接网关才需要） |
 | `CLOUDFLARE_API_TOKEN` | **Secret** | 可选。仅维护工具（Vectorize 对账/清理）与网关模式的 Workers AI 转发需要；建库建索引由部署环境的 wrangler 凭证完成，不靠它 |
 | `CLOUDFLARE_ACCOUNT_ID` | Variable | 不用手填：部署时 setup 脚本从部署环境自动取了写进 [vars]，多账号等取不到的场景才需要手动补 |
 | `AI_GATEWAY_BASE_URL` | Variable | AI Gateway 地址，不是密钥，可明文 |
+| `OCTOBER_XH_SOURCE_CONTRACT` | Variable | 十月许珩隔离合同版本；只在对应独立 Worker 部署时钉为 `october-xh-source-v1`，不在管理页动态开启 |
 | 其它带默认值的环境变量 | Variable | 可明文 |
 
 **口诀**：名字里有 `KEY` / `TOKEN` 的，走 Secret；其它走 Variable。

@@ -20,6 +20,12 @@ export interface Env {
   DEBUG_API_KEY?: string;
   MEMORY_MCP_API_KEY?: string;
   GUIDE_DOG_API_KEY?: string;
+  /** Exact revision enables the isolated Xu Heng source lifecycle boundary. */
+  OCTOBER_XH_SOURCE_CONTRACT?: string;
+  /** Runtime key: dedicated source ingest and source-backed recall only. */
+  OCTOBER_XH_SOURCE_API_KEY?: string;
+  /** Human-controlled review and maintenance key; never exposed to model tools. */
+  OCTOBER_XH_ADMIN_API_KEY?: string;
   CF_AIG_TOKEN?: string;
   ENABLE_DREAM?: string;
   // --- Aelios 记忆库 v2 行为开关 ---
@@ -142,7 +148,7 @@ export interface KeyProfile {
 export interface AuthResult {
   ok: true;
   profile: KeyProfile;
-  keyName: "CHATBOX_API_KEY" | "IM_API_KEY" | "DEBUG_API_KEY" | "MEMORY_MCP_API_KEY" | "GUIDE_DOG_API_KEY";
+  keyName: "CHATBOX_API_KEY" | "IM_API_KEY" | "DEBUG_API_KEY" | "MEMORY_MCP_API_KEY" | "GUIDE_DOG_API_KEY" | "OCTOBER_XH_ADMIN_API_KEY";
 }
 
 export interface OpenAIChatMessage {
