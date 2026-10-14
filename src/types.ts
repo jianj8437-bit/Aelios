@@ -26,6 +26,8 @@ export interface Env {
   OCTOBER_XH_SOURCE_API_KEY?: string;
   /** Human-controlled review and maintenance key; never exposed to model tools. */
   OCTOBER_XH_ADMIN_API_KEY?: string;
+  /** Public, commit-pinned Corresponding Source URL for the network service. */
+  OCTOBER_XH_SOURCE_CODE_URL?: string;
   CF_AIG_TOKEN?: string;
   ENABLE_DREAM?: string;
   // --- Aelios 记忆库 v2 行为开关 ---

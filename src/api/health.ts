@@ -30,7 +30,11 @@ const optionalBindings = [
 
 export function handleHealth(env: Env): Response {
   const required = isOctoberContractEnabled(env)
-    ? (["OCTOBER_XH_SOURCE_API_KEY", "OCTOBER_XH_ADMIN_API_KEY"] as const)
+    ? ([
+        "OCTOBER_XH_SOURCE_API_KEY",
+        "OCTOBER_XH_ADMIN_API_KEY",
+        "OCTOBER_XH_SOURCE_CODE_URL"
+      ] as const)
     : requiredTextVars;
   const missing_text_vars: string[] = required.filter((name) => !env[name]);
   const missing_optional_text_vars: string[] = optionalTextVars.filter((name) => !env[name]);
@@ -57,7 +61,10 @@ export function handleHealth(env: Env): Response {
         d1: Boolean(env.DB),
         vectorize: Boolean(env.VECTORIZE),
         queue: Boolean(env.MEMORY_QUEUE)
-      }
+      },
+      ...(isOctoberContractEnabled(env)
+        ? { source_code_url: env.OCTOBER_XH_SOURCE_CODE_URL || null }
+        : {})
     },
     { headers: { "Cache-Control": "public, max-age=30" } }
   );

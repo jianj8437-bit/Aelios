@@ -15,6 +15,7 @@ export const OCTOBER_XH_CONTRACT = "october-xh-source-v1";
 export const OCTOBER_XH_QUEUE_MAX_RETRIES = 3;
 
 const D1_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SOURCE_CODE_URL = /^https:\/\/github\.com\/jianj8437-bit\/Aelios\/tree\/[0-9a-f]{40}$/;
 
 function countLine(source: string, pattern: RegExp) {
   return source.split(/\r?\n/).filter((line) => pattern.test(line)).length;
@@ -55,7 +56,13 @@ function upsertVar(source: string, name: string, value: string) {
   return source.replace("[vars]\n", `[vars]\n${name} = "${value}"\n`);
 }
 
-function assertRenderedConfig(source: string, d1Id: string, entrypoint: string, migrationsDir: string) {
+function assertRenderedConfig(
+  source: string,
+  d1Id: string,
+  entrypoint: string,
+  migrationsDir: string,
+  sourceCodeUrl: string
+) {
   const requiredLines = [
     `main = "${entrypoint}"`,
     `name = "${OCTOBER_XH_RESOURCES.worker}"`,
@@ -67,6 +74,7 @@ function assertRenderedConfig(source: string, d1Id: string, entrypoint: string, 
     `dead_letter_queue = "${OCTOBER_XH_RESOURCES.queueDlq}"`,
     `VECTORIZE_INDEX_NAME = "${OCTOBER_XH_RESOURCES.vectorize}"`,
     `OCTOBER_XH_SOURCE_CONTRACT = "${OCTOBER_XH_CONTRACT}"`,
+    `OCTOBER_XH_SOURCE_CODE_URL = "${sourceCodeUrl}"`,
     'MEMORY_LIFECYCLE_ENABLED = "true"',
     'RECALL_REQUIRE_D1_BACKING = "true"',
     'CANDIDATE_JUDGE_ENABLED = "false"'
@@ -96,10 +104,14 @@ function assertRenderedConfig(source: string, d1Id: string, entrypoint: string, 
 export function renderOctoberXhConfig(
   source: string,
   d1Id: string,
+  sourceCodeUrl: string,
   entrypoint = "src/index.ts",
   migrationsDir = "migrations"
 ) {
   if (!D1_ID.test(d1Id)) throw new Error("--d1-id must be a Cloudflare D1 UUID");
+  if (!SOURCE_CODE_URL.test(sourceCodeUrl)) {
+    throw new Error("--source-code-url must pin the public October fork to an exact 40-character commit");
+  }
   if (entrypoint !== "src/index.ts" && !isAbsolute(entrypoint)) {
     throw new Error("external config entrypoint must be absolute");
   }
@@ -135,15 +147,22 @@ export function renderOctoberXhConfig(
     `database_name = "${OCTOBER_XH_RESOURCES.d1}"\ndatabase_id = "${d1Id}"\nmigrations_dir = "${migrationsDir}"`
   );
   rendered = upsertVar(rendered, "OCTOBER_XH_SOURCE_CONTRACT", OCTOBER_XH_CONTRACT);
+  rendered = upsertVar(rendered, "OCTOBER_XH_SOURCE_CODE_URL", sourceCodeUrl);
   rendered = upsertVar(rendered, "MEMORY_LIFECYCLE_ENABLED", "true");
   rendered = upsertVar(rendered, "RECALL_REQUIRE_D1_BACKING", "true");
   rendered = upsertVar(rendered, "CANDIDATE_JUDGE_ENABLED", "false");
   rendered = `${rendered.trimEnd()}\n`;
-  assertRenderedConfig(rendered, d1Id, entrypoint, migrationsDir);
+  assertRenderedConfig(rendered, d1Id, entrypoint, migrationsDir, sourceCodeUrl);
   return rendered;
 }
 
-export function writeOctoberXhConfig(sourcePath: string, outputPath: string, d1Id: string, repositoryRoot: string) {
+export function writeOctoberXhConfig(
+  sourcePath: string,
+  outputPath: string,
+  d1Id: string,
+  sourceCodeUrl: string,
+  repositoryRoot: string
+) {
   if (!isAbsolute(outputPath)) throw new Error("--out must be an absolute path outside the repository");
   const resolvedRoot = resolve(repositoryRoot);
   const resolvedOutput = resolve(outputPath);
@@ -154,6 +173,7 @@ export function writeOctoberXhConfig(sourcePath: string, outputPath: string, d1I
   const rendered = renderOctoberXhConfig(
     readFileSync(sourcePath, "utf8"),
     d1Id,
+    sourceCodeUrl,
     resolve(resolvedRoot, "src/index.ts"),
     resolve(resolvedRoot, "migrations")
   );
@@ -182,6 +202,7 @@ if (import.meta.url === invokedPath) {
       resolve(root, "wrangler.toml"),
       option(process.argv.slice(2), "--out"),
       option(process.argv.slice(2), "--d1-id"),
+      option(process.argv.slice(2), "--source-code-url"),
       root
     );
     console.log(JSON.stringify(result, null, 2));

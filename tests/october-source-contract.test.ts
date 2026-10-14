@@ -72,6 +72,7 @@ function setup() {
     OCTOBER_XH_SOURCE_CONTRACT: OCTOBER_CONTRACT_REVISION,
     OCTOBER_XH_SOURCE_API_KEY: "synthetic-source-key",
     OCTOBER_XH_ADMIN_API_KEY: "synthetic-admin-key",
+    OCTOBER_XH_SOURCE_CODE_URL: `https://github.com/jianj8437-bit/Aelios/tree/${"a".repeat(40)}`,
     MEMORY_LIFECYCLE_ENABLED: "true",
     RECALL_REQUIRE_D1_BACKING: "true",
     CANDIDATE_JUDGE_ENABLED: "false",
@@ -210,9 +211,37 @@ test("October-only health requires dedicated contract secrets, not the generic c
     assert.equal(missingAdmin.ok, false);
     assert.deepEqual(missingAdmin.missing_text_vars, ["OCTOBER_XH_ADMIN_API_KEY"]);
     assert.equal(missingAdmin.missing_text_vars.includes("CHATBOX_API_KEY"), false);
+
+    env.OCTOBER_XH_ADMIN_API_KEY = "synthetic-admin-key";
+    delete env.OCTOBER_XH_SOURCE_CODE_URL;
+    const missingSourceOffer = await responseJson(handleHealth(env));
+    assert.equal(missingSourceOffer.ok, false);
+    assert.deepEqual(missingSourceOffer.missing_text_vars, ["OCTOBER_XH_SOURCE_CODE_URL"]);
   } finally {
     sqlite.close();
   }
+});
+
+test("isolated worker exposes commit-pinned Corresponding Source on every response", async (t) => {
+  const { sqlite, env } = setup();
+  t.after(() => sqlite.close());
+  const expected = env.OCTOBER_XH_SOURCE_CODE_URL;
+  const source = await worker.fetch(
+    new Request("https://october.invalid/source"),
+    env,
+    { waitUntil() {} } as any
+  );
+  assert.equal(source.status, 200);
+  assert.equal((await responseJson(source)).source_code_url, expected);
+  assert.equal(source.headers.get("link"), `<${expected}>; rel="source"`);
+
+  const denied = await worker.fetch(
+    request("/v1/october/source-events", "wrong-key", {}),
+    env,
+    { waitUntil() {} } as any
+  );
+  assert.equal(denied.status, 401);
+  assert.equal(denied.headers.get("link"), `<${expected}>; rel="source"`);
 });
 
 test("source endpoint fixes identity, preserves exact metadata, and is idempotent", async (t) => {

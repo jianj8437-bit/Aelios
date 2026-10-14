@@ -54,6 +54,7 @@ import {
   handleOctoberSourceEvent
 } from "./api/october";
 import { isOctoberContractEnabled } from "./october/contract";
+import { handleOctoberSourceOffer, withOctoberSourceOffer } from "./october/sourceOffer";
 
 const DAILY_MAINTENANCE_CRON = "10 20 * * *";
 
@@ -99,6 +100,51 @@ async function runDailyMemoryDigestBatches(env: Env, namespace: string): Promise
   return results;
 }
 
+async function handleOctoberIsolatedRequest(request: Request, url: URL, env: Env): Promise<Response> {
+  if (request.method === "GET" && url.pathname === "/source") return handleOctoberSourceOffer(env);
+  if (request.method === "GET" && url.pathname === "/health") return handleHealth(env);
+  if (url.pathname === "/v1/october/source-events") {
+    return handleOctoberSourceEvent(request, env);
+  }
+  if (url.pathname === "/v1/memory/recall") {
+    return handleOctoberRecall(request, env);
+  }
+  if (url.pathname === "/v1/memory_boot") {
+    return handleOctoberBoot(request, env);
+  }
+  if (url.pathname === "/v1/diary" || url.pathname === "/v1/diary/recent") {
+    return handleOctoberDiary(request, env);
+  }
+  if (url.pathname === "/v1/precious") {
+    return handleOctoberDerivedList(request, env, "precious");
+  }
+  if (url.pathname === "/v1/glossary") {
+    return handleOctoberDerivedList(request, env, "glossary");
+  }
+  if (url.pathname === "/v1/longtail") {
+    return handleOctoberDerivedList(request, env, "longtail");
+  }
+  if (url.pathname === "/v1/october/reconcile") {
+    return handleOctoberReconcile(request, env);
+  }
+  if (url.pathname === "/v1/october/migrations" || url.pathname.startsWith("/v1/october/migrations/")) {
+    return handleOctoberMigration(request, env);
+  }
+  if (url.pathname.startsWith("/v1/october/candidates/")) {
+    return handleOctoberCandidateReview(request, env);
+  }
+  if (url.pathname === "/v1/candidates" && request.method === "GET") {
+    return handleMemoryCandidates(request, env);
+  }
+  if (url.pathname === "/v1/dream/status" && request.method === "GET") {
+    return handleDreamStatus(request, env);
+  }
+  if (url.pathname === "/v1/dream/run" && request.method === "POST") {
+    return handleDreamRun(request, env);
+  }
+  return openAiError("Not found", 404);
+}
+
 export default {
   async fetch(request: Request, deployed: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -117,47 +163,7 @@ export default {
     // proxy, generic ingest, MCP active writes, or direct-memory promotion and
     // bypassing the source/review contract.
     if (isOctoberContractEnabled(env)) {
-      if (request.method === "GET" && url.pathname === "/health") return handleHealth(env);
-      if (url.pathname === "/v1/october/source-events") {
-        return handleOctoberSourceEvent(request, env);
-      }
-      if (url.pathname === "/v1/memory/recall") {
-        return handleOctoberRecall(request, env);
-      }
-      if (url.pathname === "/v1/memory_boot") {
-        return handleOctoberBoot(request, env);
-      }
-      if (url.pathname === "/v1/diary" || url.pathname === "/v1/diary/recent") {
-        return handleOctoberDiary(request, env);
-      }
-      if (url.pathname === "/v1/precious") {
-        return handleOctoberDerivedList(request, env, "precious");
-      }
-      if (url.pathname === "/v1/glossary") {
-        return handleOctoberDerivedList(request, env, "glossary");
-      }
-      if (url.pathname === "/v1/longtail") {
-        return handleOctoberDerivedList(request, env, "longtail");
-      }
-      if (url.pathname === "/v1/october/reconcile") {
-        return handleOctoberReconcile(request, env);
-      }
-      if (url.pathname === "/v1/october/migrations" || url.pathname.startsWith("/v1/october/migrations/")) {
-        return handleOctoberMigration(request, env);
-      }
-      if (url.pathname.startsWith("/v1/october/candidates/")) {
-        return handleOctoberCandidateReview(request, env);
-      }
-      if (url.pathname === "/v1/candidates" && request.method === "GET") {
-        return handleMemoryCandidates(request, env);
-      }
-      if (url.pathname === "/v1/dream/status" && request.method === "GET") {
-        return handleDreamStatus(request, env);
-      }
-      if (url.pathname === "/v1/dream/run" && request.method === "POST") {
-        return handleDreamRun(request, env);
-      }
-      return openAiError("Not found", 404);
+      return withOctoberSourceOffer(await handleOctoberIsolatedRequest(request, url, env), env);
     }
 
     if (
