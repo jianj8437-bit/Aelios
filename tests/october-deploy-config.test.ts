@@ -119,3 +119,12 @@ test("the nightly Dream needs names, carries exactly its cron and switches, and 
   assert.throws(() => renderOctoberXhConfig(upstream, D1_ID, SOURCE_CODE_URL, "src/index.ts", "migrations",
     { names: { ...names, user: 'bad"name' } }), /plain characters/);
 });
+
+test("Xu Heng's own memory rules render as one escaped TOML string", () => {
+  const rendered = renderOctoberXhConfig(upstream, D1_ID, SOURCE_CODE_URL, "src/index.ts", "migrations",
+    { rules: '第一条：合成规则\n第二条："引号"也要转义' });
+  assert.equal(rendered.split("\n").filter((line) => line.startsWith("OCTOBER_XH_DREAM_RULES = ")).length, 1);
+  assert.match(rendered, /^OCTOBER_XH_DREAM_RULES = "第一条：合成规则\\n第二条：\\"引号\\"也要转义"$/m);
+  assert.throws(() => renderOctoberXhConfig(upstream, D1_ID, SOURCE_CODE_URL, "src/index.ts", "migrations",
+    { rules: "x".repeat(4001) }), /1-4000 characters/);
+});

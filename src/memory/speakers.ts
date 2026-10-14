@@ -5,6 +5,18 @@ import { cleanMessageText } from "../utils/sanitize";
 
 export type { DreamSpeakers };
 
+/** Xu Heng's own memory rules (SPEC B5), from the private deployment config; empty everywhere else. */
+export function octoberDreamRules(env: Env): string {
+  if (!isOctoberContractEnabled(env)) return "";
+  return env.OCTOBER_XH_DREAM_RULES?.trim() ?? "";
+}
+
+/** The rules as a prompt section that wins over the generic rules above it. */
+export function personRulesSection(rules: string): string[] {
+  if (!rules) return [];
+  return ["", "这个人自己的记忆规则（和上面的通用规则冲突时，以这里为准）：", rules, ""];
+}
+
 /** Xu Heng's speakers come from deployment config; Gu Chen is named apart so his words never pass as hers. */
 export function octoberSpeakers(env: Env): DreamSpeakers | null {
   const userName = env.OCTOBER_XH_USER_NAME?.trim();

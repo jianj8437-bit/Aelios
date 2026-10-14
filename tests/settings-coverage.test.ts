@@ -28,6 +28,7 @@ const INTERNAL: Record<string, string> = {
   VECTORIZE: 'Vectorize binding',
   GATEWAY_CONFIG: '内部 JSON blob（/admin 的配置本体），不是开关',
   OCTOBER_XH_SOURCE_CONTRACT: '部署时钉死的隔离合同版本；故意不允许从 /admin 动态开启',
+  OCTOBER_XH_DREAM_RULES: '许珩自己的记忆规则正文；随隔离部署放在私有配置，不进公开源码',
   OCTOBER_XH_NIGHTLY: '许珩夜间整理的总开关；随隔离部署钉死在私有配置，默认关',
   OCTOBER_XH_JUDGE: '许珩候选自动审核的开关；随隔离部署钉死在私有配置，默认关（全部留给人工）',
   OCTOBER_XH_USER_NAME: '许珩记忆里她的称呼；随隔离部署钉死在私有配置，不进公开源码',

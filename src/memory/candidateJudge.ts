@@ -18,7 +18,7 @@ import { callModelWithRetry, readModelName } from "../utils/modelCall";
 import type { Env, MessageRecord } from "../types";
 import { extractJsonObject } from "../utils/parse";
 import { createVectorMemory } from "./vectorStore";
-import { formatSpeakerTranscript, judgeSpeakerRules, loadSpeakersForNamespace, type DreamSpeakers } from "./speakers";
+import { formatSpeakerTranscript, judgeSpeakerRules, loadSpeakersForNamespace, octoberDreamRules, personRulesSection, type DreamSpeakers } from "./speakers";
 import { isOctoberContractEnabled } from "../october/contract";
 import { reviewOctoberCandidate } from "../october/store";
 import { nowIso } from "../utils/time";
@@ -143,7 +143,8 @@ export function decideJudge(
 export function buildJudgePrompt(
   candidate: MemoryCandidateRow,
   messages: MessageRecord[],
-  speakers: DreamSpeakers | null = null
+  speakers: DreamSpeakers | null = null,
+  rules = ""
 ): string {
   const tags = parseJsonArray(candidate.tags);
   const transcript = messages.length > 0 ? formatSpeakerTranscript(messages, speakers, 900) : "(没有能核对的原始消息)";
@@ -162,6 +163,7 @@ export function buildJudgePrompt(
     "只输出 JSON，不要 markdown，不要解释，不要输出思考过程。",
     "grounded / durable / should_delete 必须是 JSON 布尔值 true 或 false，不要用字符串。",
     ...judgeSpeakerRules(speakers),
+    ...personRulesSection(rules),
     "",
     "待审候选：",
     JSON.stringify({
@@ -380,7 +382,7 @@ async function runOctoberCandidateJudge(
       if (messages.length === 0) {
         judgeResult = { score: 0, grounded: false, durable: false, shouldDelete: null, reason: "没有可核对的原始消息，无法确认是否有据" };
       } else {
-        const modelResult = await callJudgeModel(env, input.model, buildJudgePrompt(candidate, messages, speakers), { id: candidate.id });
+        const modelResult = await callJudgeModel(env, input.model, buildJudgePrompt(candidate, messages, speakers, octoberDreamRules(env)), { id: candidate.id });
         if (!modelResult) {
           failed += 1;
           continue;

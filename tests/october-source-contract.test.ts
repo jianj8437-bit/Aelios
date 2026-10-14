@@ -1067,3 +1067,22 @@ test("the October nightly stays off until the private config turns it on", async
   await worker.scheduled({ cron: "10 20 * * *" } as any, env, { waitUntil: () => { scheduled += 1; } } as any);
   assert.equal(scheduled, 0);
 });
+
+test("Xu Heng's own memory rules reach the extract, digest and judge prompts only under the October contract", async () => {
+  const { buildDreamExtractPrompt } = await import("../src/memory/dreamExtract");
+  const { buildDigestPrompt } = await import("../src/memory/dream/extractPhase");
+  const { buildJudgePrompt } = await import("../src/memory/candidateJudge");
+  const { octoberDreamRules } = await import("../src/memory/speakers");
+  const { env } = setup();
+  Object.assign(env, { OCTOBER_XH_DREAM_RULES: "合成规则：引号里的话不是说话人自己的称呼" });
+  const rules = octoberDreamRules(env);
+  assert.equal(rules, "合成规则：引号里的话不是说话人自己的称呼");
+  assert.equal(octoberDreamRules({ OCTOBER_XH_DREAM_RULES: "x" } as any), "");
+  assert.match(buildDreamExtractPrompt([], [], null, rules), /这个人自己的记忆规则[\s\S]*合成规则/);
+  assert.doesNotMatch(buildDreamExtractPrompt([], [], null), /这个人自己的记忆规则/);
+  assert.match(buildDigestPrompt({ dateLabel: "2026-01-02", startIso: "a", endIso: "b", messages: [], existingMemories: [],
+    hasMore: false, rules }), /合成规则/);
+  const candidate = { id: "c", source: "dream_add", type: "event", content: "x", fact_key: null, tags: "[]",
+    confidence: 0.5, importance: 0.5, source_message_ids: "[]", target_memory_id: null } as any;
+  assert.match(buildJudgePrompt(candidate, [], null, rules), /合成规则/);
+});

@@ -24,6 +24,8 @@ export interface OctoberXhDreamSettings {
   names?: { user: string; assistant: string; guChen: string };
   nightly?: boolean;
   judge?: boolean;
+  /** Xu Heng's own memory rules (SPEC B5), several lines of plain text. */
+  rules?: string;
 }
 
 function checkedName(value: unknown, field: string): string {
@@ -64,6 +66,21 @@ function removeTopLevelTable(source: string, table: string) {
   }
   if (found !== 1) throw new Error(`expected one [${table}] table, found ${found}`);
   return output.join("\n").replace(/\n{3,}/g, "\n\n");
+}
+
+/** A multi-line rule text as one TOML basic string ("…\\n…"); JSON escaping is valid TOML here. */
+function upsertTextVar(source: string, name: string, value: string) {
+  const text = value.replace(/\r\n/g, "\n").trim();
+  if (!text || text.length > 4000 || /[\u0000-\u0008\u000b-\u001f\u007f]/.test(text)) {
+    throw new Error(`${name} must be 1-4000 characters of plain text`);
+  }
+  const pattern = new RegExp(`^${name}\\s*=.*$`);
+  const line = `${name} = ${JSON.stringify(text)}`;
+  const count = countLine(source, pattern);
+  if (count > 1) throw new Error(`duplicate [vars] entry: ${name}`);
+  if (count === 1) return source.replace(new RegExp(pattern.source, "m"), () => line);
+  if (!source.includes("[vars]\n")) throw new Error("wrangler config has no [vars] table");
+  return source.replace("[vars]\n", () => `[vars]\n${line}\n`);
 }
 
 function upsertVar(source: string, name: string, value: string) {
@@ -194,6 +211,7 @@ export function renderOctoberXhConfig(
     rendered = upsertVar(rendered, "OCTOBER_XH_GU_CHEN_NAME", checkedName(dream.names.guChen, "guChen"));
   }
   if (dream.judge) rendered = upsertVar(rendered, "OCTOBER_XH_JUDGE", "on");
+  if (dream.rules) rendered = upsertTextVar(rendered, "OCTOBER_XH_DREAM_RULES", dream.rules);
   if (dream.nightly) {
     if (!dream.names) throw new Error("the nightly Dream needs names, or Gu Chen's words would read as hers");
     rendered = upsertVar(rendered, "OCTOBER_XH_NIGHTLY", "on");
@@ -256,7 +274,8 @@ function readDreamSettings(path: string | null): OctoberXhDreamSettings {
   return {
     names: names ? { user: String(names.user ?? ""), assistant: String(names.assistant ?? ""), guChen: String(names.guChen ?? "") } : undefined,
     nightly: raw.nightly === true,
-    judge: raw.judge === true
+    judge: raw.judge === true,
+    rules: Array.isArray(raw.rules) ? raw.rules.map(String).join("\n") : typeof raw.rules === "string" ? raw.rules : undefined
   };
 }
 

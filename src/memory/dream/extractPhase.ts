@@ -5,7 +5,7 @@ import { extractDreamMemoriesFromMessages } from "../dreamExtract";
 import { readDreamMaxTokens, readDreamModel } from "../dreamEnv";
 import type { ExtractedMemory } from "../extract";
 import type { DreamSpeakers } from "../../gateway/config";
-import { loadSpeakersForNamespace } from "../speakers";
+import { loadSpeakersForNamespace, octoberDreamRules, personRulesSection } from "../speakers";
 import {
   type DailyDigestResult,
   type DigestModelCallResult,
@@ -32,6 +32,7 @@ export function buildDigestPrompt(input: {
   existingMemories: MemoryApiRecord[];
   hasMore: boolean;
   speakers?: DreamSpeakers | null;
+  rules?: string;
 }): string {
   const speakers = input.speakers ?? null;
   const speakerRule = speakers
@@ -62,6 +63,7 @@ export function buildDigestPrompt(input: {
     "- pinned=true 的旧记忆不能删除，只能在 memories_to_update 中提出更保守的补充。",
     "- 旧记忆里的临时计划/意图（例如“打算下个月充值X”）如果已经过期、已经发生、或被当天新信息取代，优先更新成持久事实或直接删除，不要让过期的打算一直躺在库里。",
     speakerRule,
+    ...personRulesSection(input.rules ?? ""),
     "- 不要提到 D1、Vectorize、RAG、数据库、记忆系统、代理层等实现细节。",
     "",
     "Dream 输出格式：",
@@ -250,7 +252,8 @@ export async function runExtractPhase(
       messages,
       existingMemories: input.existingMemories,
       hasMore,
-      speakers
+      speakers,
+      rules: octoberDreamRules(env)
     });
     modelResult = await callDigestModel(env, prompt, {
       dateLabel: input.dateLabel,

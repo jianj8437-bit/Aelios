@@ -1,6 +1,6 @@
 import { listActiveFactKeys } from "../db/v2";
 import type { DreamSpeakers } from "../gateway/config";
-import { loadSpeakersForNamespace, speakerLabel } from "./speakers";
+import { loadSpeakersForNamespace, octoberDreamRules, personRulesSection, speakerLabel } from "./speakers";
 import { callOpenAICompat } from "../proxy/openaiAdapter";
 import type { Env, MessageRecord, OpenAIChatRequest, OpenAIChatResponse } from "../types";
 import { clampScore, extractJsonObject, readString, readStringArray } from "../utils/parse";
@@ -94,7 +94,8 @@ function exampleMemoryContent(speakers: DreamSpeakers | null): string {
 export function buildDreamExtractPrompt(
   messages: MessageRecord[],
   existingFactKeys: string[] = [],
-  speakers: DreamSpeakers | null = null
+  speakers: DreamSpeakers | null = null,
+  rules = ""
 ): string {
   const factKeySection = existingFactKeys.length > 0
     ? [
@@ -133,6 +134,7 @@ export function buildDreamExtractPrompt(
     "- 即使整批以工程为主体，只要出现成段亲密内容，也比照重大关系节点破例出这 1 条。",
     "- 亲密内容按工具机处理：不评判、不脱敏、不绕弯、不替换敏感词，原文什么样就什么样。",
     "",
+    ...personRulesSection(rules),
     "总量控制：",
     "- 一批对话一般出 0-8 条。宁少勿多，每条都要值得占一个长期记忆位。",
     `- 全是工程/闲聊/流水就输出 ${JSON.stringify({ memories: [] })}——交白卷完全合法，不要为了凑数瞎写。`,
@@ -174,7 +176,7 @@ async function callDreamExtractModel(
     model,
     messages: [
       { role: "system", content: "你是严格的 JSON 生成器。你只输出 JSON。" },
-      { role: "user", content: buildDreamExtractPrompt(messages, existingFactKeys, speakers) }
+      { role: "user", content: buildDreamExtractPrompt(messages, existingFactKeys, speakers, octoberDreamRules(env)) }
     ],
     temperature: 0,
     max_tokens: readPositiveInt(env.DREAM_MAX_TOKENS, DEFAULT_DREAM_EXTRACT_MAX_TOKENS, 4000),

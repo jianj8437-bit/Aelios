@@ -36,6 +36,8 @@ export interface Env {
   OCTOBER_XH_NIGHTLY?: string;
   /** "on" lets the candidate judge settle Xu Heng's Dream candidates; anything else leaves them pending. */
   OCTOBER_XH_JUDGE?: string;
+  /** Xu Heng's own memory rules (SPEC B5), kept in the private deployment config. */
+  OCTOBER_XH_DREAM_RULES?: string;
   CF_AIG_TOKEN?: string;
   ENABLE_DREAM?: string;
   // --- Aelios 记忆库 v2 行为开关 ---
