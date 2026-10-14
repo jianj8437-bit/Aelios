@@ -1,5 +1,6 @@
 import { json } from "../utils/json";
 import type { Env } from "../types";
+import { isOctoberContractEnabled } from "../october/contract";
 
 // 必填以「零配置记忆库」为准：README 承诺不配网关、不配模型 key 也能记、召、夜整。
 // 网关/维护类变量缺了只降级不报警，否则最小部署的 /health 会一直喊
@@ -28,7 +29,10 @@ const optionalBindings = [
 ] as const;
 
 export function handleHealth(env: Env): Response {
-  const missing_text_vars: string[] = requiredTextVars.filter((name) => !env[name]);
+  const required = isOctoberContractEnabled(env)
+    ? (["OCTOBER_XH_SOURCE_API_KEY", "OCTOBER_XH_ADMIN_API_KEY"] as const)
+    : requiredTextVars;
+  const missing_text_vars: string[] = required.filter((name) => !env[name]);
   const missing_optional_text_vars: string[] = optionalTextVars.filter((name) => !env[name]);
 
   const missing_bindings = requiredBindings

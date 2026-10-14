@@ -20,6 +20,7 @@ import {
 } from "../src/october/contract";
 import { currentArtifactProvenance } from "../src/october/store";
 import { sha256Hex } from "../src/utils/hash";
+import { handleHealth } from "../src/api/health";
 
 function wrapSqlite(sqlite: DatabaseSync) {
   return {
@@ -193,6 +194,26 @@ async function migrate(env: any, path: string, body: unknown, key = "synthetic-a
   const response = await handleOctoberMigration(request(path, key, body), env);
   return { response, body: await responseJson(response) };
 }
+
+test("October-only health requires dedicated contract secrets, not the generic chat key", async () => {
+  const { sqlite, env } = setup();
+  try {
+    env.AI = {};
+    env.VECTORIZE = {};
+    env.MEMORY_QUEUE = {};
+    const healthy = await responseJson(handleHealth(env));
+    assert.equal(healthy.ok, true);
+    assert.deepEqual(healthy.missing_text_vars, []);
+
+    delete env.OCTOBER_XH_ADMIN_API_KEY;
+    const missingAdmin = await responseJson(handleHealth(env));
+    assert.equal(missingAdmin.ok, false);
+    assert.deepEqual(missingAdmin.missing_text_vars, ["OCTOBER_XH_ADMIN_API_KEY"]);
+    assert.equal(missingAdmin.missing_text_vars.includes("CHATBOX_API_KEY"), false);
+  } finally {
+    sqlite.close();
+  }
+});
 
 test("source endpoint fixes identity, preserves exact metadata, and is idempotent", async (t) => {
   const { sqlite, env } = setup();
