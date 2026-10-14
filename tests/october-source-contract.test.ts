@@ -1086,3 +1086,15 @@ test("Xu Heng's own memory rules reach the extract, digest and judge prompts onl
     confidence: 0.5, importance: 0.5, source_message_ids: "[]", target_memory_id: null } as any;
   assert.match(buildJudgePrompt(candidate, [], null, rules), /合成规则/);
 });
+
+test("the vector catch-up route is admin-only and bounded", async () => {
+  const { env } = setup();
+  const call = (key: string, body: unknown) => worker.fetch(request("/v1/october/vectors", key, body), env, { waitUntil() {} } as any);
+  assert.equal((await call("synthetic-source-key", { limit: 5 })).status, 401);
+  const response = await call("synthetic-admin-key", { limit: 500, dry_run: true });
+  assert.equal(response.status, 200);
+  const body = await responseJson(response);
+  assert.equal(body.data.namespace, OCTOBER_NAMESPACE);
+  assert.equal(body.data.dry_run, true);
+  assert.equal(body.data.active_memories, 0);
+});

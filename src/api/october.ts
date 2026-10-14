@@ -1,4 +1,5 @@
 import { buildBootPackage, runRecall } from "../memory/v2/recall";
+import { runVectorBackfill } from "../memory/vectorBackfill";
 import {
   getDailyLog,
   getMonthlyLog,
@@ -412,6 +413,36 @@ export async function handleOctoberCandidateReview(request: Request, env: Env): 
           : undefined
     });
     return json({ data: result });
+  } catch (error) {
+    return contractError(error);
+  }
+}
+
+/**
+ * Embeds Xu Heng's active memories that have no vector yet (migrated LMC-5 cards, or an embedding that failed),
+ * a bounded number per call. The nightly does the same 50 at a time; this lets an operator catch up without
+ * turning the nightly on. Admin key only.
+ */
+export async function handleOctoberVectorBackfill(request: Request, env: Env): Promise<Response> {
+  try {
+    requireEnabled(env);
+    if (request.method !== "POST") {
+      throw new OctoberContractError("not_found", "Not found", 404);
+    }
+    await requireAdminAuth(request, env);
+    const body = await readObject(request);
+    const limit = Math.min(Math.max(Math.floor(optionalFiniteNumber(body.limit) ?? 25), 1), 50);
+    const report = await runVectorBackfill(env, { namespace: OCTOBER_NAMESPACE, dryRun: body.dry_run === true, limit });
+    return json({
+      data: {
+        namespace: report.namespace,
+        dry_run: report.dry_run,
+        active_memories: report.active_memories,
+        counts: report.counts,
+        repair: report.repair && { ...report.repair, failed: report.repair.failed.slice(0, 10) },
+        errors: report.errors.slice(0, 10)
+      }
+    });
   } catch (error) {
     return contractError(error);
   }

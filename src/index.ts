@@ -51,7 +51,8 @@ import {
   handleOctoberMigration,
   handleOctoberRecall,
   handleOctoberReconcile,
-  handleOctoberSourceEvent
+  handleOctoberSourceEvent,
+  handleOctoberVectorBackfill
 } from "./api/october";
 import { isOctoberContractEnabled, OCTOBER_NAMESPACE } from "./october/contract";
 import { handleOctoberSourceOffer, withOctoberSourceOffer } from "./october/sourceOffer";
@@ -126,6 +127,9 @@ async function handleOctoberIsolatedRequest(request: Request, url: URL, env: Env
   }
   if (url.pathname === "/v1/october/reconcile") {
     return handleOctoberReconcile(request, env);
+  }
+  if (url.pathname === "/v1/october/vectors") {
+    return handleOctoberVectorBackfill(request, env);
   }
   if (url.pathname === "/v1/october/migrations" || url.pathname.startsWith("/v1/october/migrations/")) {
     return handleOctoberMigration(request, env);
