@@ -66,6 +66,8 @@ function assertRenderedConfig(
   const requiredLines = [
     `main = "${entrypoint}"`,
     `name = "${OCTOBER_XH_RESOURCES.worker}"`,
+    "workers_dev = true",
+    "preview_urls = false",
     `index_name = "${OCTOBER_XH_RESOURCES.vectorize}"`,
     `database_name = "${OCTOBER_XH_RESOURCES.d1}"`,
     `database_id = "${d1Id}"`,
@@ -121,6 +123,15 @@ export function renderOctoberXhConfig(
   let rendered = source.replace(/\r\n/g, "\n");
   rendered = replaceExactLine(rendered, /^main = "src\/index\.ts"$/, `main = "${entrypoint}"`);
   rendered = replaceExactLine(rendered, /^name = "companion-memory-proxy"$/, `name = "${OCTOBER_XH_RESOURCES.worker}"`);
+  for (const setting of ["workers_dev", "preview_urls"]) {
+    if (countLine(rendered, new RegExp(`^${setting}\\s*=`)) !== 0) {
+      throw new Error(`upstream config already defines or duplicates: ${setting}`);
+    }
+  }
+  rendered = rendered.replace(
+    `name = "${OCTOBER_XH_RESOURCES.worker}"`,
+    `name = "${OCTOBER_XH_RESOURCES.worker}"\nworkers_dev = true\npreview_urls = false`
+  );
   rendered = removeTopLevelTable(rendered, "triggers");
   rendered = replaceExactLine(rendered, /^VECTORIZE_INDEX_NAME = "memo-kb"$/, `VECTORIZE_INDEX_NAME = "${OCTOBER_XH_RESOURCES.vectorize}"`);
   rendered = replaceExactLine(rendered, /^index_name = "memo-kb"$/, `index_name = "${OCTOBER_XH_RESOURCES.vectorize}"`);

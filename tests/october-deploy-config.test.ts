@@ -20,6 +20,8 @@ const sourceContractMigration = readFileSync(resolve(root, "migrations/0017_octo
 test("renders isolated October Xu Heng bindings with cron disabled", () => {
   const rendered = renderOctoberXhConfig(upstream, D1_ID, SOURCE_CODE_URL);
   assert.match(rendered, new RegExp(`^name = "${OCTOBER_XH_RESOURCES.worker}"$`, "m"));
+  assert.match(rendered, /^workers_dev = true$/m);
+  assert.match(rendered, /^preview_urls = false$/m);
   assert.match(rendered, new RegExp(`^database_name = "${OCTOBER_XH_RESOURCES.d1}"$`, "m"));
   assert.match(rendered, new RegExp(`^database_id = "${D1_ID}"$`, "m"));
   assert.match(rendered, new RegExp(`^index_name = "${OCTOBER_XH_RESOURCES.vectorize}"$`, "m"));
@@ -63,6 +65,10 @@ test("fails closed on invalid resource identity or upstream config drift", () =>
   assert.throws(
     () => renderOctoberXhConfig(upstream.replace("max_batch_size = 10", "max_retries = 7\nmax_batch_size = 10"), D1_ID, SOURCE_CODE_URL),
     /duplicates: max_retries/
+  );
+  assert.throws(
+    () => renderOctoberXhConfig(upstream.replace('name = "companion-memory-proxy"', 'name = "companion-memory-proxy"\npreview_urls = true'), D1_ID, SOURCE_CODE_URL),
+    /duplicates: preview_urls/
   );
 });
 
