@@ -10,6 +10,7 @@
     "setup:cloudflare": "node scripts/setup-cloudflare.mjs",
     "deploy:cloudflare": "npm run deploy",
     "deploy:bare": "wrangler deploy --keep-vars",
+    "render:october-xh-config": "node --import tsx scripts/render-october-xh-config.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.tests.json",
     "lint": "biome lint . --max-diagnostics=none",
     "test:gateway": "node --import tsx --test tests/gateway.test.ts tests/request-contract.test.ts",
