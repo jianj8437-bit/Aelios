@@ -286,9 +286,12 @@ test("source endpoint fixes identity, preserves exact metadata, and is idempoten
     { messages: 1, sources: 1, events: 1 }
   );
   const message = sqlite.prepare("SELECT * FROM messages").get() as any;
-  assert.equal(message.created_at, firstInput.event_time);
+  // The message table holds the same instant in UTC (upstream compares it with UTC day ranges as text);
+  // the ledger keeps the source's exact event_time.
+  assert.equal(message.created_at, new Date(firstInput.event_time).toISOString());
   assert.equal(message.role, firstInput.role);
   const ledger = sqlite.prepare("SELECT * FROM october_source_ledger").get() as any;
+  assert.equal(ledger.event_time, firstInput.event_time);
   assert.equal(ledger.speaker, firstInput.speaker);
   assert.equal(ledger.conversation_id, firstInput.conversation_id);
 
@@ -962,4 +965,73 @@ test("a source edit racing approved-memory FTS removes the late stale row", asyn
   pause.release();
   assert.equal((await review).status, 200);
   assert.equal((sqlite.prepare("SELECT count(*) AS n FROM memory_fts").get() as any).n, 0);
+});
+
+test("an early-morning Beijing message lands on its own day in the Dream range", async () => {
+  const { env } = setup();
+  const early = await sourceEvent({
+    source_id: "synthetic/early-morning",
+    conversation_id: "xh:synthetic-thread",
+    speaker: "participant:user",
+    role: "user",
+    event_time: "2026-01-02T00:30:00+08:00",
+    revision: 1,
+    operation: "upsert",
+    content: "synthetic early-morning message"
+  });
+  assert.equal((await ingest(env, early)).response.status, 200);
+  const { getDateRangeForLabel } = await import("../src/memory/dreamDates");
+  const { listMessagesByNamespaceInRange } = await import("../src/db/messages");
+  const inDay = (label: string) => {
+    const range = getDateRangeForLabel(label, "Asia/Singapore");
+    return listMessagesByNamespaceInRange(env.DB, {
+      namespace: OCTOBER_NAMESPACE, startCreatedAt: range.startIso, endCreatedAt: range.endIso, limit: 10
+    });
+  };
+  assert.equal((await inDay("2026-01-02")).length, 1);
+  assert.equal((await inDay("2026-01-01")).length, 0);
+});
+
+test("migration 0018 moves offset-stamped October rows onto UTC and leaves other rows alone", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  for (const file of readdirSync("migrations").filter((name) => name.endsWith(".sql") && name < "0018").sort()) {
+    sqlite.exec(readFileSync(`migrations/${file}`, "utf8"));
+  }
+  sqlite.prepare(
+    "INSERT INTO messages (id, conversation_id, namespace, role, content, source, created_at, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run("m1", "xh:t", "xu-heng", "user", "x", "shiyue-authoritative-chat", "2026-10-15T00:30:00+08:00", 0);
+  sqlite.prepare(
+    "INSERT INTO messages (id, conversation_id, namespace, role, content, source, created_at, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run("m2", "other", "default", "user", "y", "gateway", "2026-10-15T00:30:00+08:00", 0);
+  sqlite.exec(readFileSync("migrations/0018_october_message_time_utc.sql", "utf8"));
+  const rows = sqlite.prepare("SELECT id, created_at FROM messages ORDER BY id").all() as any[];
+  assert.deepEqual(rows.map((row) => row.created_at), ["2026-10-14T16:30:00.000Z", "2026-10-15T00:30:00+08:00"]);
+});
+
+test("Dream transcripts name Gu Chen apart from her and from Xu Heng", async () => {
+  const { env } = setup();
+  Object.assign(env, { OCTOBER_XH_USER_NAME: "她", OCTOBER_XH_ASSISTANT_NAME: "他", OCTOBER_XH_GU_CHEN_NAME: "第三人" });
+  const rows: EventInput[] = [
+    { source_id: "synthetic/room-1", conversation_id: "xh:room", speaker: "participant:user", role: "user",
+      event_time: "2026-01-02T10:00:00+08:00", revision: 1, operation: "upsert", content: "合成：她说今天下雨" },
+    { source_id: "synthetic/room-2", conversation_id: "xh:room", speaker: "participant:gu-chen", role: "user",
+      event_time: "2026-01-02T10:00:05+08:00", revision: 1, operation: "upsert", content: "合成：第三人说带伞" },
+    { source_id: "synthetic/room-3", conversation_id: "xh:room", speaker: "agent:xu-heng", role: "assistant",
+      event_time: "2026-01-02T10:00:10+08:00", revision: 1, operation: "upsert", content: "合成：他说好" }
+  ];
+  for (const row of rows) assert.equal((await ingest(env, await sourceEvent(row))).response.status, 200);
+  const { getDateRangeForLabel } = await import("../src/memory/dreamDates");
+  const { listMessagesByNamespaceInRange } = await import("../src/db/messages");
+  const { formatTranscript } = await import("../src/memory/dream/helpers");
+  const { loadSpeakersForNamespace, nameOnlyRule } = await import("../src/memory/speakers");
+  const range = getDateRangeForLabel("2026-01-02", "Asia/Singapore");
+  const messages = await listMessagesByNamespaceInRange(env.DB, {
+    namespace: OCTOBER_NAMESPACE, startCreatedAt: range.startIso, endCreatedAt: range.endIso, limit: 10
+  });
+  const speakers = await loadSpeakersForNamespace(env, OCTOBER_NAMESPACE);
+  const transcript = formatTranscript(messages, speakers);
+  assert.match(transcript, /\[她\] 合成：她说今天下雨/);
+  assert.match(transcript, /\[第三人\] 合成：第三人说带伞/);
+  assert.match(transcript, /\[他\] 合成：他说好/);
+  assert.match(nameOnlyRule(speakers!), /标为「第三人」的话是他说的/);
 });

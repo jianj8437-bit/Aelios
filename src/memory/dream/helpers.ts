@@ -4,6 +4,7 @@ import { listMemoriesPage } from "../../db/memories";
 import { readCursor } from "../../db/retention";
 import { archiveMemory, fetchMemoryLifecycleRows } from "../../db/v2";
 import type { DreamSpeakers } from "../../gateway/config";
+import { speakerLabel } from "../speakers";
 import type { Env, MemoryApiRecord, MessageRecord } from "../../types";
 import { getDateRangeForLabel } from "../dreamDates";
 import { DEFAULT_EMPTY_MEMORY_MIN_CHARS } from "../dreamEnv";
@@ -214,9 +215,7 @@ export function normalizeDigestResult(value: unknown): DailyDigestResult {
 export function formatTranscript(messages: MessageRecord[], speakers: DreamSpeakers | null = null): string {
   return messages
     .map((message) => {
-      const role = message.role === "assistant"
-        ? (speakers?.assistantName ?? "我(助手)")
-        : (speakers?.userName ?? "用户");
+      const role = speakerLabel(message.role, speakers, message.speaker);
       return `[${message.id}][${message.created_at}][${role}] ${truncate(cleanMessageText(message.content), 700)}`;
     })
     .join("\n\n");

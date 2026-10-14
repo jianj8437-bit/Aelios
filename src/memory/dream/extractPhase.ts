@@ -4,7 +4,8 @@ import { extractJsonObject } from "../../utils/parse";
 import { extractDreamMemoriesFromMessages } from "../dreamExtract";
 import { readDreamMaxTokens, readDreamModel } from "../dreamEnv";
 import type { ExtractedMemory } from "../extract";
-import { loadConfig, speakersForNamespace, type DreamSpeakers } from "../../gateway/config";
+import type { DreamSpeakers } from "../../gateway/config";
+import { loadSpeakersForNamespace } from "../speakers";
 import {
   type DailyDigestResult,
   type DigestModelCallResult,
@@ -239,7 +240,7 @@ export async function runExtractPhase(
   let messages = input.messages;
   let hasMore = input.hasMore;
   let modelResult: DigestModelCallResult;
-  const speakers = speakersForNamespace(await loadConfig(env), input.namespace);
+  const speakers = await loadSpeakersForNamespace(env, input.namespace);
 
   for (;;) {
     const prompt = buildDigestPrompt({

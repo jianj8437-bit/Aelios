@@ -1,5 +1,6 @@
 import { listActiveFactKeys } from "../db/v2";
-import { loadConfig, speakersForNamespace, type DreamSpeakers } from "../gateway/config";
+import type { DreamSpeakers } from "../gateway/config";
+import { loadSpeakersForNamespace, speakerLabel } from "./speakers";
 import { callOpenAICompat } from "../proxy/openaiAdapter";
 import type { Env, MessageRecord, OpenAIChatRequest, OpenAIChatResponse } from "../types";
 import { clampScore, extractJsonObject, readString, readStringArray } from "../utils/parse";
@@ -62,9 +63,7 @@ function parseExtractModelOutput(text: string): ExtractedMemory[] | null {
 function formatTranscript(messages: MessageRecord[], speakers: DreamSpeakers | null): string {
   return messages
     .map((message) => {
-      const role = message.role === "assistant"
-        ? (speakers?.assistantName ?? "我(助手)")
-        : (speakers?.userName ?? "用户");
+      const role = speakerLabel(message.role, speakers, message.speaker);
       return `[${message.id}][${message.created_at}][${role}] ${cleanMessageText(message.content).slice(0, 900)}`;
     })
     .join("\n\n");
@@ -206,6 +205,6 @@ export async function extractDreamMemoriesFromMessages(
   const existingFactKeys = await listActiveFactKeys(env.DB, { namespace: input.namespace });
   const speakers = input.speakers !== undefined
     ? input.speakers
-    : speakersForNamespace(await loadConfig(env), input.namespace);
+    : await loadSpeakersForNamespace(env, input.namespace);
   return callDreamExtractModel(env, input.messages, existingFactKeys, speakers);
 }

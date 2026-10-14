@@ -14,6 +14,13 @@ import {
   octoberReviewMemoryId
 } from "./contract";
 
+// The ledger keeps the source's own event_time exactly. The upstream message table is compared with UTC day
+// ranges (Dream, diary, retention), so it stores the same instant in UTC: "2026-10-15T00:30:00+08:00" becomes
+// "2026-10-14T16:30:00.000Z" and lands on 10-15 in Asia/Singapore, not on 10-14.
+function utcInstant(eventTime: string): string {
+  return new Date(eventTime).toISOString();
+}
+
 export type OctoberArtifactKind =
   | "candidate"
   | "memory"
@@ -383,7 +390,7 @@ export async function applyOctoberSourceEvent(
          VALUES (?, ?, NULL, ?, ?)
          ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at`
       )
-      .bind(event.conversation_id, OCTOBER_NAMESPACE, event.event_time, stamp)
+      .bind(event.conversation_id, OCTOBER_NAMESPACE, utcInstant(event.event_time), stamp)
   );
 
   if (event.operation === "upsert") {
@@ -408,7 +415,7 @@ export async function applyOctoberSourceEvent(
           event.role,
           event.content,
           OCTOBER_SOURCE,
-          event.event_time,
+          utcInstant(event.event_time),
           event.role === "user" ? 0 : 1
         )
     );

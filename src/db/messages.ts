@@ -156,6 +156,31 @@ export async function saveAssistantMessage(
   return id;
 }
 
+/**
+ * Xu Heng's messages carry who said them (the October source ledger), so a transcript can name Gu Chen
+ * apart from her. Other namespaces have no ledger and are returned as they are.
+ */
+export async function withOctoberSpeakers(
+  db: D1Database,
+  namespace: string,
+  messages: MessageRecord[]
+): Promise<MessageRecord[]> {
+  if (namespace !== "xu-heng" || messages.length === 0) return messages;
+  const speakers = new Map<string, string>();
+  for (let i = 0; i < messages.length; i += 50) {
+    const ids = messages.slice(i, i + 50).map((message) => message.id);
+    const rows = await db
+      .prepare(
+        `SELECT message_id, speaker FROM october_source_ledger
+         WHERE namespace = ? AND message_id IN (${ids.map(() => "?").join(", ")})`
+      )
+      .bind(namespace, ...ids)
+      .all<{ message_id: string; speaker: string }>();
+    for (const row of rows.results ?? []) speakers.set(row.message_id, row.speaker);
+  }
+  return messages.map((message) => ({ ...message, speaker: speakers.get(message.id) ?? null }));
+}
+
 export async function getMessagesByIds(
   db: D1Database,
   input: { namespace: string; ids: string[] }
@@ -173,7 +198,7 @@ export async function getMessagesByIds(
     .bind(input.namespace, ...input.ids)
     .all<MessageRecord>();
 
-  return result.results ?? [];
+  return withOctoberSpeakers(db, input.namespace, result.results ?? []);
 }
 
 export async function countMessagesAfterTimestamp(
@@ -222,7 +247,7 @@ export async function listMessagesByNamespace(
   binds.push(limit);
 
   const result = await db.prepare(sql).bind(...binds).all<MessageRecord>();
-  return result.results ?? [];
+  return withOctoberSpeakers(db, namespace, result.results ?? []);
 }
 
 function appendAfterCursor(
@@ -268,7 +293,7 @@ export async function listMessagesByNamespaceInRange(
   binds.push(input.limit);
 
   const result = await db.prepare(sql).bind(...binds).all<MessageRecord>();
-  return result.results ?? [];
+  return withOctoberSpeakers(db, input.namespace, result.results ?? []);
 }
 
 export async function saveIngestMessages(

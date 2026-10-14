@@ -28,6 +28,10 @@ export interface Env {
   OCTOBER_XH_ADMIN_API_KEY?: string;
   /** Public, commit-pinned Corresponding Source URL for the network service. */
   OCTOBER_XH_SOURCE_CODE_URL?: string;
+  /** Display names for Xu Heng's transcripts; kept in deployment config, not in source. */
+  OCTOBER_XH_USER_NAME?: string;
+  OCTOBER_XH_ASSISTANT_NAME?: string;
+  OCTOBER_XH_GU_CHEN_NAME?: string;
   CF_AIG_TOKEN?: string;
   ENABLE_DREAM?: string;
   // --- Aelios 记忆库 v2 行为开关 ---
@@ -218,6 +222,8 @@ export interface MessageRecord {
   created_at: string;
   /** Turn-local order. Hash IDs are unique only; same-timestamp rows sort by seq. */
   seq?: number;
+  /** October source speaker (e.g. participant:gu-chen); null outside the October contract. */
+  speaker?: string | null;
 }
 
 export type MemoryVersionStatus = "current" | "superseded" | "under_review";

@@ -128,6 +128,8 @@ export function identityReadNamespaces(identity: Identity): string[] {
 export type DreamSpeakers = {
   userName: string;
   assistantName: string;
+  /** Other named people in the transcript, by October source speaker (e.g. participant:gu-chen). */
+  others?: Record<string, string>;
 };
 
 /** 写记忆/日记用的说话人名字。没填用户名则返回 null，回退到旧的「你/我」。 */

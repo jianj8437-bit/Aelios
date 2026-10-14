@@ -1,4 +1,4 @@
-import { listMessagesByNamespaceInRange } from "../db/messages";
+import { listMessagesByNamespaceInRange, withOctoberSpeakers } from "../db/messages";
 import { getDailyLog, getWeeklyLog, upsertDailyLog } from "../db/v2";
 import type { Env, MessageRecord } from "../types";
 import { callModelWithRetry, ModelCallError, readModelName } from "../utils/modelCall";
@@ -143,7 +143,7 @@ async function listMessagesTailInRange(
     )
     .bind(input.namespace, input.startCreatedAt, input.endCreatedAt, input.limit)
     .all<MessageRecord>();
-  return (result.results ?? []).reverse();
+  return withOctoberSpeakers(db, input.namespace, (result.results ?? []).reverse());
 }
 
 async function fetchDiaryMessages(
