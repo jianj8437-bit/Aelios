@@ -148,17 +148,17 @@ ALTER TABLE glossary ADD COLUMN source_message_ids TEXT;
 CREATE TRIGGER october_source_first_revision_guard
 BEFORE INSERT ON october_source_ledger
 BEGIN
-  SELECT CASE WHEN NEW.revision <> 1
-    THEN RAISE(ABORT, 'october_source_first_revision_must_be_one') END;
+  SELECT (CASE WHEN NEW.revision <> 1
+    THEN RAISE(ABORT, 'october_source_first_revision_must_be_one') END);
 END;
 
 CREATE TRIGGER october_source_revision_guard
 BEFORE UPDATE OF revision, operation, state, content_sha256, conversation_id,
   speaker, role, event_time, message_id ON october_source_ledger
 BEGIN
-  SELECT CASE WHEN NEW.revision <> OLD.revision + 1
-    THEN RAISE(ABORT, 'october_source_revision_must_be_contiguous') END;
-  SELECT CASE WHEN
+  SELECT (CASE WHEN NEW.revision <> OLD.revision + 1
+    THEN RAISE(ABORT, 'october_source_revision_must_be_contiguous') END);
+  SELECT (CASE WHEN
     NEW.namespace <> OLD.namespace OR
     NEW.source <> OLD.source OR
     NEW.source_id <> OLD.source_id OR
@@ -166,13 +166,13 @@ BEGIN
     NEW.speaker <> OLD.speaker OR
     NEW.role <> OLD.role OR
     NEW.event_time <> OLD.event_time
-    THEN RAISE(ABORT, 'october_source_identity_metadata_immutable') END;
+    THEN RAISE(ABORT, 'october_source_identity_metadata_immutable') END);
 END;
 
 CREATE TRIGGER october_source_ref_current_guard
 BEFORE INSERT ON october_source_refs
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1
     FROM october_source_ledger l
     WHERE l.namespace = NEW.namespace
@@ -180,14 +180,14 @@ BEGIN
       AND l.source_id = NEW.source_id
       AND l.state = 'active'
       AND l.revision = NEW.source_revision
-  ) THEN RAISE(ABORT, 'october_source_ref_not_current') END;
+  ) THEN RAISE(ABORT, 'october_source_ref_not_current') END);
 END;
 
 CREATE TRIGGER october_source_ref_update_current_guard
 BEFORE UPDATE OF source_revision, state ON october_source_refs
 WHEN NEW.state IN ('pending', 'active')
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1
     FROM october_source_ledger l
     WHERE l.namespace = NEW.namespace
@@ -195,7 +195,7 @@ BEGIN
       AND l.source_id = NEW.source_id
       AND l.state = 'active'
       AND l.revision = NEW.source_revision
-  ) THEN RAISE(ABORT, 'october_source_ref_not_current') END;
+  ) THEN RAISE(ABORT, 'october_source_ref_not_current') END);
 END;
 
 -- ---------------------------------------------------------------------
@@ -208,13 +208,13 @@ CREATE TRIGGER october_candidate_source_guard
 BEFORE INSERT ON memory_candidates
 WHEN NEW.namespace = 'xu-heng'
 BEGIN
-  SELECT CASE WHEN NEW.status <> 'pending'
-    THEN RAISE(ABORT, 'october_candidate_must_start_pending') END;
-  SELECT CASE WHEN json_valid(COALESCE(NEW.source_message_ids, '')) = 0
+  SELECT (CASE WHEN NEW.status <> 'pending'
+    THEN RAISE(ABORT, 'october_candidate_must_start_pending') END);
+  SELECT (CASE WHEN json_valid(COALESCE(NEW.source_message_ids, '')) = 0
       OR json_type(NEW.source_message_ids) <> 'array'
       OR json_array_length(NEW.source_message_ids) = 0
-    THEN RAISE(ABORT, 'october_candidate_requires_sources') END;
-  SELECT CASE WHEN EXISTS (
+    THEN RAISE(ABORT, 'october_candidate_requires_sources') END);
+  SELECT (CASE WHEN EXISTS (
     SELECT 1 FROM json_each(NEW.source_message_ids) j
     WHERE typeof(j.value) <> 'text' OR NOT EXISTS (
       SELECT 1 FROM october_source_ledger l
@@ -222,7 +222,7 @@ BEGIN
         AND l.message_id = j.value
         AND l.state = 'active'
     )
-  ) THEN RAISE(ABORT, 'october_candidate_source_not_current') END;
+  ) THEN RAISE(ABORT, 'october_candidate_source_not_current') END);
 END;
 
 CREATE TRIGGER october_candidate_attach_sources
@@ -279,11 +279,11 @@ CREATE TRIGGER october_memory_source_guard
 BEFORE INSERT ON memories
 WHEN NEW.namespace = 'xu-heng' AND NEW.status = 'active'
 BEGIN
-  SELECT CASE WHEN json_valid(COALESCE(NEW.source_message_ids, '')) = 0
+  SELECT (CASE WHEN json_valid(COALESCE(NEW.source_message_ids, '')) = 0
       OR json_type(NEW.source_message_ids) <> 'array'
       OR json_array_length(NEW.source_message_ids) = 0
-    THEN RAISE(ABORT, 'october_memory_requires_sources') END;
-  SELECT CASE WHEN EXISTS (
+    THEN RAISE(ABORT, 'october_memory_requires_sources') END);
+  SELECT (CASE WHEN EXISTS (
     SELECT 1 FROM json_each(NEW.source_message_ids) j
     WHERE typeof(j.value) <> 'text' OR NOT EXISTS (
       SELECT 1 FROM october_source_ledger l
@@ -291,7 +291,7 @@ BEGIN
         AND l.message_id = j.value
         AND l.state = 'active'
     )
-  ) THEN RAISE(ABORT, 'october_memory_source_not_current') END;
+  ) THEN RAISE(ABORT, 'october_memory_source_not_current') END);
 END;
 
 CREATE TRIGGER october_memory_attach_sources
@@ -354,34 +354,34 @@ CREATE TRIGGER october_daily_source_guard
 BEFORE INSERT ON daily_log
 WHEN NEW.namespace = 'xu-heng'
 BEGIN
-  SELECT CASE WHEN json_valid(COALESCE(NEW.source_message_ids, '')) = 0
+  SELECT (CASE WHEN json_valid(COALESCE(NEW.source_message_ids, '')) = 0
       OR json_type(NEW.source_message_ids) <> 'array'
       OR json_array_length(NEW.source_message_ids) = 0
-    THEN RAISE(ABORT, 'october_daily_requires_sources') END;
-  SELECT CASE WHEN EXISTS (
+    THEN RAISE(ABORT, 'october_daily_requires_sources') END);
+  SELECT (CASE WHEN EXISTS (
     SELECT 1 FROM json_each(NEW.source_message_ids) j
     WHERE typeof(j.value) <> 'text' OR NOT EXISTS (
       SELECT 1 FROM october_source_ledger l
       WHERE l.namespace = NEW.namespace AND l.message_id = j.value AND l.state = 'active'
     )
-  ) THEN RAISE(ABORT, 'october_daily_source_not_current') END;
+  ) THEN RAISE(ABORT, 'october_daily_source_not_current') END);
 END;
 
 CREATE TRIGGER october_daily_update_source_guard
 BEFORE UPDATE OF source_message_ids ON daily_log
 WHEN OLD.namespace = 'xu-heng'
 BEGIN
-  SELECT CASE WHEN json_valid(COALESCE(NEW.source_message_ids, '')) = 0
+  SELECT (CASE WHEN json_valid(COALESCE(NEW.source_message_ids, '')) = 0
       OR json_type(NEW.source_message_ids) <> 'array'
       OR json_array_length(NEW.source_message_ids) = 0
-    THEN RAISE(ABORT, 'october_daily_requires_sources') END;
-  SELECT CASE WHEN EXISTS (
+    THEN RAISE(ABORT, 'october_daily_requires_sources') END);
+  SELECT (CASE WHEN EXISTS (
     SELECT 1 FROM json_each(NEW.source_message_ids) j
     WHERE typeof(j.value) <> 'text' OR NOT EXISTS (
       SELECT 1 FROM october_source_ledger l
       WHERE l.namespace = NEW.namespace AND l.message_id = j.value AND l.state = 'active'
     )
-  ) THEN RAISE(ABORT, 'october_daily_source_not_current') END;
+  ) THEN RAISE(ABORT, 'october_daily_source_not_current') END);
 END;
 
 CREATE TRIGGER october_daily_attach_sources
@@ -424,17 +424,17 @@ CREATE TRIGGER october_precious_source_guard
 BEFORE INSERT ON precious
 WHEN NEW.namespace = 'xu-heng'
 BEGIN
-  SELECT CASE WHEN json_valid(COALESCE(NEW.context_message_ids, '')) = 0
+  SELECT (CASE WHEN json_valid(COALESCE(NEW.context_message_ids, '')) = 0
       OR json_type(NEW.context_message_ids) <> 'array'
       OR json_array_length(NEW.context_message_ids) = 0
-    THEN RAISE(ABORT, 'october_precious_requires_sources') END;
-  SELECT CASE WHEN EXISTS (
+    THEN RAISE(ABORT, 'october_precious_requires_sources') END);
+  SELECT (CASE WHEN EXISTS (
     SELECT 1 FROM json_each(NEW.context_message_ids) j
     WHERE typeof(j.value) <> 'text' OR NOT EXISTS (
       SELECT 1 FROM october_source_ledger l
       WHERE l.namespace = NEW.namespace AND l.message_id = j.value AND l.state = 'active'
     )
-  ) THEN RAISE(ABORT, 'october_precious_source_not_current') END;
+  ) THEN RAISE(ABORT, 'october_precious_source_not_current') END);
 END;
 
 CREATE TRIGGER october_precious_attach_sources
@@ -462,17 +462,17 @@ CREATE TRIGGER october_longtail_source_guard
 BEFORE INSERT ON longtail
 WHEN NEW.namespace = 'xu-heng'
 BEGIN
-  SELECT CASE WHEN json_valid(COALESCE(NEW.source_message_ids, '')) = 0
+  SELECT (CASE WHEN json_valid(COALESCE(NEW.source_message_ids, '')) = 0
       OR json_type(NEW.source_message_ids) <> 'array'
       OR json_array_length(NEW.source_message_ids) = 0
-    THEN RAISE(ABORT, 'october_longtail_requires_sources') END;
-  SELECT CASE WHEN EXISTS (
+    THEN RAISE(ABORT, 'october_longtail_requires_sources') END);
+  SELECT (CASE WHEN EXISTS (
     SELECT 1 FROM json_each(NEW.source_message_ids) j
     WHERE typeof(j.value) <> 'text' OR NOT EXISTS (
       SELECT 1 FROM october_source_ledger l
       WHERE l.namespace = NEW.namespace AND l.message_id = j.value AND l.state = 'active'
     )
-  ) THEN RAISE(ABORT, 'october_longtail_source_not_current') END;
+  ) THEN RAISE(ABORT, 'october_longtail_source_not_current') END);
 END;
 
 CREATE TRIGGER october_longtail_attach_sources
@@ -500,17 +500,17 @@ CREATE TRIGGER october_glossary_source_guard
 BEFORE INSERT ON glossary
 WHEN NEW.namespace = 'xu-heng' AND NEW.status = 'active'
 BEGIN
-  SELECT CASE WHEN json_valid(COALESCE(NEW.source_message_ids, '')) = 0
+  SELECT (CASE WHEN json_valid(COALESCE(NEW.source_message_ids, '')) = 0
       OR json_type(NEW.source_message_ids) <> 'array'
       OR json_array_length(NEW.source_message_ids) = 0
-    THEN RAISE(ABORT, 'october_glossary_requires_sources') END;
-  SELECT CASE WHEN EXISTS (
+    THEN RAISE(ABORT, 'october_glossary_requires_sources') END);
+  SELECT (CASE WHEN EXISTS (
     SELECT 1 FROM json_each(NEW.source_message_ids) j
     WHERE typeof(j.value) <> 'text' OR NOT EXISTS (
       SELECT 1 FROM october_source_ledger l
       WHERE l.namespace = NEW.namespace AND l.message_id = j.value AND l.state = 'active'
     )
-  ) THEN RAISE(ABORT, 'october_glossary_source_not_current') END;
+  ) THEN RAISE(ABORT, 'october_glossary_source_not_current') END);
 END;
 
 CREATE TRIGGER october_glossary_attach_sources
@@ -546,14 +546,14 @@ CREATE TRIGGER october_weekly_source_guard
 BEFORE INSERT ON weekly_log
 WHEN NEW.namespace = 'xu-heng'
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM october_source_refs r
     JOIN october_source_ledger l
       ON l.namespace = r.namespace AND l.source = r.source AND l.source_id = r.source_id
     WHERE r.namespace = NEW.namespace AND r.artifact_kind = 'daily'
       AND r.artifact_id >= NEW.start_date AND r.artifact_id <= NEW.end_date
       AND r.state = 'active' AND l.state = 'active' AND l.revision = r.source_revision
-  ) THEN RAISE(ABORT, 'october_weekly_requires_current_daily_sources') END;
+  ) THEN RAISE(ABORT, 'october_weekly_requires_current_daily_sources') END);
 END;
 
 CREATE TRIGGER october_weekly_attach_sources
@@ -600,7 +600,7 @@ CREATE TRIGGER october_monthly_source_guard
 BEFORE INSERT ON monthly_log
 WHEN NEW.namespace = 'xu-heng'
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM weekly_log w
     JOIN october_source_refs r
       ON r.namespace = w.namespace AND r.artifact_kind = 'weekly' AND r.artifact_id = w.week
@@ -608,7 +608,7 @@ BEGIN
       ON l.namespace = r.namespace AND l.source = r.source AND l.source_id = r.source_id
     WHERE w.namespace = NEW.namespace AND substr(w.start_date, 1, 7) = NEW.month
       AND r.state = 'active' AND l.state = 'active' AND l.revision = r.source_revision
-  ) THEN RAISE(ABORT, 'october_monthly_requires_current_weekly_sources') END;
+  ) THEN RAISE(ABORT, 'october_monthly_requires_current_weekly_sources') END);
 END;
 
 CREATE TRIGGER october_monthly_attach_sources
@@ -659,31 +659,31 @@ END;
 CREATE TRIGGER october_review_decision_guard
 BEFORE INSERT ON october_review_decisions
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM memory_candidates c
     WHERE c.namespace = NEW.namespace AND c.id = NEW.candidate_id AND c.status = 'pending'
-  ) THEN RAISE(ABORT, 'october_candidate_not_pending') END;
-  SELECT CASE WHEN NOT EXISTS (
+  ) THEN RAISE(ABORT, 'october_candidate_not_pending') END);
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM october_source_refs r
     JOIN october_source_ledger l
       ON l.namespace = r.namespace AND l.source = r.source AND l.source_id = r.source_id
     WHERE r.namespace = NEW.namespace AND r.artifact_kind = 'candidate'
       AND r.artifact_id = NEW.candidate_id AND r.state = 'pending'
       AND l.state = 'active' AND l.revision = r.source_revision
-  ) THEN RAISE(ABORT, 'october_candidate_sources_not_current') END;
-  SELECT CASE WHEN EXISTS (
+  ) THEN RAISE(ABORT, 'october_candidate_sources_not_current') END);
+  SELECT (CASE WHEN EXISTS (
     SELECT 1 FROM october_source_refs r
     LEFT JOIN october_source_ledger l
       ON l.namespace = r.namespace AND l.source = r.source AND l.source_id = r.source_id
     WHERE r.namespace = NEW.namespace AND r.artifact_kind = 'candidate'
       AND r.artifact_id = NEW.candidate_id
       AND (r.state <> 'pending' OR l.state <> 'active' OR l.revision <> r.source_revision)
-  ) THEN RAISE(ABORT, 'october_candidate_sources_not_current') END;
-  SELECT CASE WHEN NEW.action = 'approve' AND NEW.result_state = 'active' AND NOT EXISTS (
+  ) THEN RAISE(ABORT, 'october_candidate_sources_not_current') END);
+  SELECT (CASE WHEN NEW.action = 'approve' AND NEW.result_state = 'active' AND NOT EXISTS (
     SELECT 1 FROM memories m
     WHERE m.namespace = NEW.namespace AND m.id = NEW.result_artifact_id AND m.status = 'active'
-  ) THEN RAISE(ABORT, 'october_review_result_memory_missing') END;
-  SELECT CASE WHEN NEW.action = 'approve' AND EXISTS (
+  ) THEN RAISE(ABORT, 'october_review_result_memory_missing') END);
+  SELECT (CASE WHEN NEW.action = 'approve' AND EXISTS (
     SELECT 1 FROM memory_candidates c
     WHERE c.namespace = NEW.namespace AND c.id = NEW.candidate_id
       AND c.target_memory_id IS NOT NULL
@@ -691,5 +691,5 @@ BEGIN
     SELECT 1 FROM memory_candidates c
     JOIN memories m ON m.namespace = c.namespace AND m.id = c.target_memory_id
     WHERE c.namespace = NEW.namespace AND c.id = NEW.candidate_id AND m.status = 'active'
-  ) THEN RAISE(ABORT, 'october_review_target_not_active') END;
+  ) THEN RAISE(ABORT, 'october_review_target_not_active') END);
 END;

@@ -14,6 +14,7 @@ import {
 const D1_ID = "11111111-2222-4333-8444-555555555555";
 const root = resolve(import.meta.dirname, "..");
 const upstream = readFileSync(resolve(root, "wrangler.toml"), "utf8");
+const sourceContractMigration = readFileSync(resolve(root, "migrations/0017_october_source_contract.sql"), "utf8");
 
 test("renders isolated October Xu Heng bindings with cron disabled", () => {
   const rendered = renderOctoberXhConfig(upstream, D1_ID);
@@ -38,6 +39,12 @@ test("renders bounded queue retries with an isolated dead-letter queue", () => {
   assert.match(rendered, new RegExp(`^dead_letter_queue = "${OCTOBER_XH_RESOURCES.queueDlq}"$`, "m"));
   assert.equal(rendered.match(/^max_retries\s*=/gm)?.length, 1);
   assert.equal(rendered.match(/^dead_letter_queue\s*=/gm)?.length, 1);
+});
+
+test("keeps source-contract triggers compatible with the remote D1 migration splitter", () => {
+  assert.doesNotMatch(sourceContractMigration, /\r/);
+  assert.doesNotMatch(sourceContractMigration, /^\s*SELECT CASE\b/m);
+  assert.match(sourceContractMigration, /^\s*SELECT \(CASE\b/m);
 });
 
 test("fails closed on invalid resource identity or upstream config drift", () => {
