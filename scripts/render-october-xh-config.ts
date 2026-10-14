@@ -7,10 +7,12 @@ export const OCTOBER_XH_RESOURCES = Object.freeze({
   worker: "october-xh-aelios",
   d1: "october-xh-aelios-db",
   vectorize: "october-xh-aelios-vector",
-  queue: "october-xh-aelios-queue"
+  queue: "october-xh-aelios-queue",
+  queueDlq: "october-xh-aelios-dlq"
 });
 
 export const OCTOBER_XH_CONTRACT = "october-xh-source-v1";
+export const OCTOBER_XH_QUEUE_MAX_RETRIES = 3;
 
 const D1_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -59,6 +61,8 @@ function assertRenderedConfig(source: string, d1Id: string) {
     `index_name = "${OCTOBER_XH_RESOURCES.vectorize}"`,
     `database_name = "${OCTOBER_XH_RESOURCES.d1}"`,
     `database_id = "${d1Id}"`,
+    `max_retries = ${OCTOBER_XH_QUEUE_MAX_RETRIES}`,
+    `dead_letter_queue = "${OCTOBER_XH_RESOURCES.queueDlq}"`,
     `VECTORIZE_INDEX_NAME = "${OCTOBER_XH_RESOURCES.vectorize}"`,
     `OCTOBER_XH_SOURCE_CONTRACT = "${OCTOBER_XH_CONTRACT}"`,
     'MEMORY_LIFECYCLE_ENABLED = "true"',
@@ -95,6 +99,19 @@ export function renderOctoberXhConfig(source: string, d1Id: string) {
   rendered = replaceExactLine(rendered, /^VECTORIZE_INDEX_NAME = "memo-kb"$/, `VECTORIZE_INDEX_NAME = "${OCTOBER_XH_RESOURCES.vectorize}"`);
   rendered = replaceExactLine(rendered, /^index_name = "memo-kb"$/, `index_name = "${OCTOBER_XH_RESOURCES.vectorize}"`);
   rendered = replaceExactLine(rendered, /^queue = "companion-memory"$/, `queue = "${OCTOBER_XH_RESOURCES.queue}"`, 2);
+  for (const setting of ["max_retries", "dead_letter_queue"]) {
+    if (countLine(rendered, new RegExp(`^${setting}\\s*=`)) !== 0) {
+      throw new Error(`upstream config already defines or duplicates: ${setting}`);
+    }
+  }
+  const consumerQueue = `[[queues.consumers]]\nqueue = "${OCTOBER_XH_RESOURCES.queue}"`;
+  if (rendered.split(consumerQueue).length !== 2) {
+    throw new Error("expected one isolated October Xu Heng queue consumer");
+  }
+  rendered = rendered.replace(
+    consumerQueue,
+    `${consumerQueue}\nmax_retries = ${OCTOBER_XH_QUEUE_MAX_RETRIES}\ndead_letter_queue = "${OCTOBER_XH_RESOURCES.queueDlq}"`
+  );
   rendered = replaceExactLine(rendered, /^database_name = "companion_memory_proxy"$/, `database_name = "${OCTOBER_XH_RESOURCES.d1}"`);
   rendered = rendered.replace(
     `database_name = "${OCTOBER_XH_RESOURCES.d1}"`,

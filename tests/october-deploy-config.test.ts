@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import {
   OCTOBER_XH_CONTRACT,
+  OCTOBER_XH_QUEUE_MAX_RETRIES,
   OCTOBER_XH_RESOURCES,
   renderOctoberXhConfig,
   writeOctoberXhConfig
@@ -31,6 +32,14 @@ test("renders isolated October Xu Heng bindings with cron disabled", () => {
   assert.doesNotMatch(rendered, /name = "companion-memory-proxy"|index_name = "memo-kb"|queue = "companion-memory"|database_name = "companion_memory_proxy"/);
 });
 
+test("renders bounded queue retries with an isolated dead-letter queue", () => {
+  const rendered = renderOctoberXhConfig(upstream, D1_ID);
+  assert.match(rendered, new RegExp(`^max_retries = ${OCTOBER_XH_QUEUE_MAX_RETRIES}$`, "m"));
+  assert.match(rendered, new RegExp(`^dead_letter_queue = "${OCTOBER_XH_RESOURCES.queueDlq}"$`, "m"));
+  assert.equal(rendered.match(/^max_retries\s*=/gm)?.length, 1);
+  assert.equal(rendered.match(/^dead_letter_queue\s*=/gm)?.length, 1);
+});
+
 test("fails closed on invalid resource identity or upstream config drift", () => {
   assert.throws(() => renderOctoberXhConfig(upstream, "not-a-d1-id"), /D1 UUID/);
   assert.throws(
@@ -40,6 +49,10 @@ test("fails closed on invalid resource identity or upstream config drift", () =>
   assert.throws(
     () => renderOctoberXhConfig(upstream.replace("[triggers]", "[scheduled]"), D1_ID),
     /expected one \[triggers\]/
+  );
+  assert.throws(
+    () => renderOctoberXhConfig(upstream.replace("max_batch_size = 10", "max_retries = 7\nmax_batch_size = 10"), D1_ID),
+    /duplicates: max_retries/
   );
 });
 
