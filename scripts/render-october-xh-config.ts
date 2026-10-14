@@ -55,8 +55,9 @@ function upsertVar(source: string, name: string, value: string) {
   return source.replace("[vars]\n", `[vars]\n${name} = "${value}"\n`);
 }
 
-function assertRenderedConfig(source: string, d1Id: string) {
+function assertRenderedConfig(source: string, d1Id: string, entrypoint: string) {
   const requiredLines = [
+    `main = "${entrypoint}"`,
     `name = "${OCTOBER_XH_RESOURCES.worker}"`,
     `index_name = "${OCTOBER_XH_RESOURCES.vectorize}"`,
     `database_name = "${OCTOBER_XH_RESOURCES.d1}"`,
@@ -91,9 +92,13 @@ function assertRenderedConfig(source: string, d1Id: string) {
   }
 }
 
-export function renderOctoberXhConfig(source: string, d1Id: string) {
+export function renderOctoberXhConfig(source: string, d1Id: string, entrypoint = "src/index.ts") {
   if (!D1_ID.test(d1Id)) throw new Error("--d1-id must be a Cloudflare D1 UUID");
+  if (entrypoint !== "src/index.ts" && !isAbsolute(entrypoint)) {
+    throw new Error("external config entrypoint must be absolute");
+  }
   let rendered = source.replace(/\r\n/g, "\n");
+  rendered = replaceExactLine(rendered, /^main = "src\/index\.ts"$/, `main = "${entrypoint}"`);
   rendered = replaceExactLine(rendered, /^name = "companion-memory-proxy"$/, `name = "${OCTOBER_XH_RESOURCES.worker}"`);
   rendered = removeTopLevelTable(rendered, "triggers");
   rendered = replaceExactLine(rendered, /^VECTORIZE_INDEX_NAME = "memo-kb"$/, `VECTORIZE_INDEX_NAME = "${OCTOBER_XH_RESOURCES.vectorize}"`);
@@ -122,7 +127,7 @@ export function renderOctoberXhConfig(source: string, d1Id: string) {
   rendered = upsertVar(rendered, "RECALL_REQUIRE_D1_BACKING", "true");
   rendered = upsertVar(rendered, "CANDIDATE_JUDGE_ENABLED", "false");
   rendered = `${rendered.trimEnd()}\n`;
-  assertRenderedConfig(rendered, d1Id);
+  assertRenderedConfig(rendered, d1Id, entrypoint);
   return rendered;
 }
 
@@ -134,7 +139,11 @@ export function writeOctoberXhConfig(sourcePath: string, outputPath: string, d1I
   if (withinRepository === "" || (!withinRepository.startsWith("..") && !isAbsolute(withinRepository))) {
     throw new Error("refusing to write an account-specific D1 id inside the repository");
   }
-  const rendered = renderOctoberXhConfig(readFileSync(sourcePath, "utf8"), d1Id);
+  const rendered = renderOctoberXhConfig(
+    readFileSync(sourcePath, "utf8"),
+    d1Id,
+    resolve(resolvedRoot, "src/index.ts")
+  );
   writeFileSync(resolvedOutput, rendered, { encoding: "utf8", flag: "wx", mode: 0o600 });
   chmodSync(resolvedOutput, 0o600);
   return {

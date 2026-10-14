@@ -65,10 +65,15 @@ test("writes mode 0600 outside the repository and never overwrites", () => {
     assert.equal(result.cron, "disabled");
     assert.equal(result.secretsRendered, false);
     assert.equal(statSync(output).mode & 0o777, 0o600);
+    assert.match(readFileSync(output, "utf8"), new RegExp(`^main = "${resolve(root, "src/index.ts")}"$`, "m"));
     assert.throws(() => writeOctoberXhConfig(resolve(root, "wrangler.toml"), output, D1_ID, root), /EEXIST/);
     assert.throws(
       () => writeOctoberXhConfig(resolve(root, "wrangler.toml"), resolve(root, "wrangler.october-xh.toml"), D1_ID, root),
       /inside the repository/
+    );
+    assert.throws(
+      () => renderOctoberXhConfig(upstream.replace('main = "src/index.ts"', 'main = "src/renamed.ts"'), D1_ID),
+      /expected 1 config line/
     );
   } finally {
     rmSync(temp, { recursive: true, force: true });
