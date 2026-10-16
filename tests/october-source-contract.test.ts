@@ -917,6 +917,26 @@ test("a source edit racing an approved embedding removes the late vector", async
   assert.equal(deletedIds.flat().filter((id) => id === memory.vector_id).length, 2);
 });
 
+test("a new message is indexed without scanning the whole message FTS table", async (t) => {
+  const { sqlite, env } = setup();
+  t.after(() => sqlite.close());
+  const prepare = env.DB.prepare;
+  const seen: string[] = [];
+  env.DB.prepare = (sql: string) => {
+    seen.push(sql);
+    return prepare(sql);
+  };
+  const first = await sourceEvent(firstInput);
+  assert.equal((await ingest(env, first)).response.status, 200);
+  assert.equal(seen.filter((sql) => /DELETE FROM message_fts/.test(sql)).length, 0);
+
+  const edited = await sourceEvent({ ...firstInput, revision: 2, content: "revision two" });
+  assert.equal((await ingest(env, edited)).response.status, 200);
+  const currentMessageId = (sqlite.prepare("SELECT message_id FROM october_source_ledger").get() as any).message_id;
+  const rows = sqlite.prepare("SELECT message_id FROM message_fts ORDER BY message_id").all() as any[];
+  assert.deepEqual(rows.map((row) => row.message_id), [currentMessageId]);
+});
+
 test("a source edit racing raw-message FTS removes the late stale row", async (t) => {
   const { sqlite, env } = setup();
   t.after(() => sqlite.close());

@@ -56,13 +56,17 @@ export async function deleteFtsRow(
 
 export async function upsertMessageFts(
   db: D1Database,
-  input: { namespace: string; messageId: string; content: string }
+  input: { namespace: string; messageId: string; content: string; fresh?: boolean }
 ): Promise<boolean> {
   const body = toFtsBody(cleanMessageText(input.content));
   if (!body) return false;
   try {
     await withRetry(async () => {
-      await db.prepare("DELETE FROM message_fts WHERE message_id = ?").bind(input.messageId).run();
+      // message_id is UNINDEXED in FTS5, so this delete reads every row of message_fts. A caller
+      // whose id cannot have a row yet (`fresh`) skips it.
+      if (!input.fresh) {
+        await db.prepare("DELETE FROM message_fts WHERE message_id = ?").bind(input.messageId).run();
+      }
       await db
         .prepare("INSERT INTO message_fts (fts_body, namespace, message_id) VALUES (?, ?, ?)")
         .bind(body, input.namespace, input.messageId)

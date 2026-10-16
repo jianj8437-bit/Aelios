@@ -525,10 +525,14 @@ export async function applyOctoberSourceEvent(
 
   if (event.operation === "upsert" && event.content !== null) {
     if (await sourceMessageIsCurrent(env.DB, event)) {
+      // Each revision has its own message_id (octoberMessageId) and the batch above already removed
+      // the previous revision's row, so there is nothing to replace: without the delete, one message
+      // reads a few rows instead of the whole message_fts table (her free D1 plan, 2026-10-16).
       const indexed = await upsertMessageFts(env.DB, {
         namespace: OCTOBER_NAMESPACE,
         messageId: event.message_id,
-        content: event.content
+        content: event.content,
+        fresh: true
       });
       if (indexed && !(await sourceMessageIsCurrent(env.DB, event))) {
         await deleteFtsRow(env.DB, "message_fts", "message_id", event.message_id);
