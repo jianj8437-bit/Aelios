@@ -44,12 +44,8 @@ import { handleQueueMessage } from "./queue/consumer";
 import type { Env, QueueMessage } from "./types";
 import { openAiError } from "./utils/json";
 import {
-  handleOctoberBoot,
   handleOctoberCandidateReview,
-  handleOctoberDerivedList,
-  handleOctoberDiary,
   handleOctoberMigration,
-  handleOctoberRecall,
   handleOctoberReconcile,
   handleOctoberSourceEvent,
   handleOctoberVectorBackfill
@@ -101,29 +97,16 @@ async function runDailyMemoryDigestBatches(env: Env, namespace: string): Promise
   return results;
 }
 
-async function handleOctoberIsolatedRequest(request: Request, url: URL, env: Env): Promise<Response> {
+/**
+ * The routes only the October sync needs. Everything else (the /admin panel, memory, candidates, Dream,
+ * recall) is upstream Aelios as it is (her 2026-10-16 call: 「我们直接套用这个开源记忆库先用一段时间，然后
+ * 再看问题，修改」), so this answers null and the upstream router takes the request.
+ */
+async function handleOctoberIsolatedRequest(request: Request, url: URL, env: Env): Promise<Response | null> {
   if (request.method === "GET" && url.pathname === "/source") return handleOctoberSourceOffer(env);
   if (request.method === "GET" && url.pathname === "/health") return handleHealth(env);
   if (url.pathname === "/v1/october/source-events") {
     return handleOctoberSourceEvent(request, env);
-  }
-  if (url.pathname === "/v1/memory/recall") {
-    return handleOctoberRecall(request, env);
-  }
-  if (url.pathname === "/v1/memory_boot") {
-    return handleOctoberBoot(request, env);
-  }
-  if (url.pathname === "/v1/diary" || url.pathname === "/v1/diary/recent") {
-    return handleOctoberDiary(request, env);
-  }
-  if (url.pathname === "/v1/precious") {
-    return handleOctoberDerivedList(request, env, "precious");
-  }
-  if (url.pathname === "/v1/glossary") {
-    return handleOctoberDerivedList(request, env, "glossary");
-  }
-  if (url.pathname === "/v1/longtail") {
-    return handleOctoberDerivedList(request, env, "longtail");
   }
   if (url.pathname === "/v1/october/reconcile") {
     return handleOctoberReconcile(request, env);
@@ -137,20 +120,10 @@ async function handleOctoberIsolatedRequest(request: Request, url: URL, env: Env
   if (url.pathname.startsWith("/v1/october/candidates/")) {
     return handleOctoberCandidateReview(request, env);
   }
-  if (url.pathname === "/v1/candidates" && request.method === "GET") {
-    return handleMemoryCandidates(request, env);
-  }
-  if (url.pathname === "/v1/dream/status" && request.method === "GET") {
-    return handleDreamStatus(request, env);
-  }
-  if (url.pathname === "/v1/dream/run" && request.method === "POST") {
-    return handleDreamRun(request, env);
-  }
-  return openAiError("Not found", 404);
+  return null;
 }
 
-export default {
-  async fetch(request: Request, deployed: Env, ctx: ExecutionContext): Promise<Response> {
+async function routeRequest(request: Request, deployed: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/admin/gateway") return new Response(null, { status: 302, headers: { location: "/admin", "cache-control": "no-store" } });
@@ -162,12 +135,9 @@ export default {
 
     const env = applySettings(deployed, await loadSettings(deployed));
 
-    // The isolated October worker has a deliberately small service surface.
-    // This allowlist prevents an admin/runtime key from reaching Aelios' chat
-    // proxy, generic ingest, MCP active writes, or direct-memory promotion and
-    // bypassing the source/review contract.
     if (isOctoberContractEnabled(env)) {
-      return withOctoberSourceOffer(await handleOctoberIsolatedRequest(request, url, env), env);
+      const october = await handleOctoberIsolatedRequest(request, url, env);
+      if (october) return october;
     }
 
     if (
@@ -300,17 +270,16 @@ export default {
     }
 
     return openAiError("Not found", 404);
+}
+
+export default {
+  async fetch(request: Request, deployed: Env, ctx: ExecutionContext): Promise<Response> {
+    // Every response carries the Corresponding Source link (AGPL), upstream routes included.
+    return withOctoberSourceOffer(await routeRequest(request, deployed, ctx), deployed);
   },
 
   async queue(batch: MessageBatch<QueueMessage>, deployed: Env): Promise<void> {
     const env = applySettings(deployed, await loadSettings(deployed));
-    if (isOctoberContractEnabled(env)) {
-      console.log("october source contract queue disabled", { messages: batch.messages.length });
-      // Preserve unexpected messages for operator review. An isolated worker
-      // must not acknowledge and discard work from a mistakenly shared queue.
-      for (const message of batch.messages) message.retry();
-      return;
-    }
     for (const message of batch.messages) {
       try {
         await handleQueueMessage(message.body, env);

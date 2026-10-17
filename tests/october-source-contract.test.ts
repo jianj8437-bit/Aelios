@@ -712,20 +712,30 @@ test("daily, weekly, and monthly derivatives share the same current-source gate"
   assert.equal((await currentArtifactProvenance(db as any, "monthly", ["2025-12"])).size, 0);
 });
 
-test("isolated worker allowlist rejects generic active-memory writes", async (t) => {
+test("the October worker serves upstream's /admin panel and keeps its own sync routes", async (t) => {
   const { sqlite, env } = setup();
   t.after(() => sqlite.close());
-  const response = await worker.fetch(
-    request(
-      "/v1/memory",
-      "synthetic-admin-key",
-      { content: "must not bypass review", source_message_ids: [] }
-    ),
-    env,
-    { waitUntil() {} } as any
-  );
-  assert.equal(response.status, 404);
-  assert.equal((sqlite.prepare("SELECT count(*) AS n FROM memories").get() as any).n, 0);
+  const panel = await worker.fetch(new Request("https://october.invalid/admin"), env, { waitUntil() {} } as any);
+  assert.equal(panel.status, 200);
+  assert.match(panel.headers.get("content-type") || "", /text\/html/);
+  assert.match(panel.headers.get("link") || "", /rel="source"/);
+
+  const first = await sourceEvent(firstInput);
+  assert.equal((await ingest(env, first)).response.status, 200);
+});
+
+test("a memory added without sources is kept; one citing a gone message is not", async (t) => {
+  const { sqlite } = setup();
+  t.after(() => sqlite.close());
+  const insert = (id: string, sources: string) => sqlite.prepare(
+    `INSERT INTO memories (
+       id, namespace, type, content, importance, confidence, status, pinned,
+       tags, source, source_message_ids, vector_id, created_at, updated_at
+     ) VALUES (?, ?, 'note', 'from the panel', 0.5, 0.8, 'active', 0, '[]', 'admin', ?, ?, 't', 't')`
+  ).run(id, OCTOBER_NAMESPACE, sources, `mem_${id}`);
+  insert("panel", "[]");
+  assert.equal((sqlite.prepare("SELECT count(*) AS n FROM memories").get() as any).n, 1);
+  assert.throws(() => insert("ghost", JSON.stringify(["msg_gone"])), /october_memory_source_not_current/);
 });
 
 test("boot, diary, and derived lists omit every stale source-backed layer", async (t) => {
