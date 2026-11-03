@@ -63,7 +63,7 @@ test("fails closed on invalid resource identity or upstream config drift", () =>
     /expected one \[triggers\]/
   );
   assert.throws(
-    () => renderOctoberXhConfig(upstream.replace("max_batch_size = 10", "max_retries = 7\nmax_batch_size = 10"), D1_ID, SOURCE_CODE_URL),
+    () => renderOctoberXhConfig(upstream.replace("max_batch_size = 1\n", "max_retries = 7\nmax_batch_size = 1\n"), D1_ID, SOURCE_CODE_URL),
     /duplicates: max_retries/
   );
   assert.throws(
@@ -93,7 +93,7 @@ test("writes mode 0600 outside the repository and never overwrites", () => {
       /expected 1 config line/
     );
     assert.throws(
-      () => renderOctoberXhConfig(upstream.replace("max_batch_size = 10", 'migrations_dir = "elsewhere"\nmax_batch_size = 10'), D1_ID, SOURCE_CODE_URL),
+      () => renderOctoberXhConfig(upstream.replace("max_batch_size = 1\n", 'migrations_dir = "elsewhere"\nmax_batch_size = 1\n'), D1_ID, SOURCE_CODE_URL),
       /duplicates: migrations_dir/
     );
   } finally {

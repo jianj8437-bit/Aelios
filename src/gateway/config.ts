@@ -21,7 +21,10 @@ export interface Identity {
   keys: AuthResult["keyName"][];
   /** Main models: recalled and recorded. Every other model passes through quietly. */
   models: string[];
-  anthropicThinking?: "passthrough" | "drop_block";
+  /** Omitted means auto: drop_block on the native Anthropic line, passthrough elsewhere. */
+  anthropicThinking?: "auto" | "passthrough" | "drop_block";
+  /** Omitted means on: coding agents are recorded as conversation only (see coding.ts). False records everything. */
+  codingFilter?: boolean;
   maxMemoryChars?: number;
   /** 用户显示名。Dream / 日记 / 周月卷 / 审核写事实时用这个名字，不要写 user/用户。 */
   userName?: string;
@@ -33,6 +36,12 @@ export interface GatewayConfig {
   upstream?: Upstream;
   identities: Identity[];
   settings?: Record<string, string>;
+  /**
+   * What GET /v1/models shows, in the owner's order: picked from the upstream catalog plus names typed by hand.
+   * Display only. Calls are never checked against it, so a model that is not listed still works.
+   * Absent or empty: the whole upstream catalog is shown, as before.
+   */
+  modelList?: string[];
 }
 /** The guard that opens untrusted JSON up for every caller; see the note on `Body` in protocol.ts. */
 // biome-ignore lint/suspicious/noExplicitAny: see above
@@ -47,6 +56,22 @@ const KEY_NAMES = ["CHATBOX_API_KEY", "IM_API_KEY", "DEBUG_API_KEY", "GUIDE_DOG_
 // Slugs are the first path segment, so they cannot shadow existing entry points.
 const RESERVED_SLUGS = ["v1", "api", "admin", "health", "mcp", "memory-mcp", "memory-admin", "guide-dog"];
 
+export const MODEL_LIST_MAX = 300;
+/** Trimmed, de-duplicated, order kept; an empty list is the same as none. */
+function validateModelList(value: unknown): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  check(Array.isArray(value), "modelList must be an array of model names");
+  const names: string[] = [];
+  for (const entry of value) {
+    check(text(entry) && entry.trim().length <= 200 && !/\s/.test(entry.trim()),
+      "modelList: each model name must be text without spaces (max 200 characters)");
+    const name = entry.trim();
+    if (!names.includes(name)) names.push(name);
+  }
+  check(names.length <= MODEL_LIST_MAX, `modelList: at most ${MODEL_LIST_MAX} models`);
+  return names.length ? names : undefined;
+}
+
 export function validateConfig(value: unknown): GatewayConfig {
   check(object(value) && value.version === 3, "Gateway config requires version: 3");
   if (value.upstream !== undefined) {
@@ -59,6 +84,8 @@ export function validateConfig(value: unknown): GatewayConfig {
     }
   }
   value.settings = validateSettings(value.settings);
+  value.modelList = validateModelList(value.modelList);
+  if (!value.modelList) delete value.modelList;
   check(Array.isArray(value.identities), "identities must be an array");
   const slugs = new Set<string>();
   for (const identity of value.identities) {
@@ -79,12 +106,17 @@ export function validateConfig(value: unknown): GatewayConfig {
     check(Array.isArray(identity.models) && identity.models.length <= 64 &&
       identity.models.every((m: unknown) => text(m) && (m as string).length <= 200),
       `${where}: models must be an array of at most 64 model names`);
-    check(identity.anthropicThinking === undefined || ["passthrough", "drop_block"].includes(identity.anthropicThinking), `${where}: invalid anthropicThinking`);
+    check(identity.anthropicThinking === undefined || ["auto", "passthrough", "drop_block"].includes(identity.anthropicThinking), `${where}: invalid anthropicThinking`);
+    check(identity.codingFilter === undefined || typeof identity.codingFilter === "boolean",
+      `${where}: codingFilter must be true or false`);
     check(identity.maxMemoryChars === undefined || Number.isInteger(identity.maxMemoryChars) && identity.maxMemoryChars >= 256 && identity.maxMemoryChars <= 24000, `${where}: maxMemoryChars must be 256–24000`);
     check(identity.userName === undefined || text(identity.userName) && identity.userName.trim().length <= 32 && !/[\r\n]/.test(identity.userName),
       `${where}: userName must be text (max 32 characters)`);
     check(identity.assistantName === undefined || text(identity.assistantName) && identity.assistantName.trim().length <= 32 && !/[\r\n]/.test(identity.assistantName),
       `${where}: assistantName must be text (max 32 characters)`);
+    // 主模型自己审候选这条路拆了 (只剩 clef 和 MCP)，旧配置里的这两项下次保存时顺手清掉。
+    delete identity.judgeModel;
+    delete identity.judgeWithMainModel;
   }
   return value as unknown as GatewayConfig;
 }

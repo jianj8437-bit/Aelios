@@ -1066,29 +1066,15 @@ test("Dream transcripts name Gu Chen apart from her and from Xu Heng", async () 
   assert.match(nameOnlyRule(speakers!), /标为「第三人」的话是他说的/);
 });
 
-test("Xu Heng's judge is careful with changes and boundaries and leaves people's cards alone", async () => {
-  const { octoberApproveMin, listOctoberCandidatesToJudge, runCandidateJudge } = await import("../src/memory/candidateJudge");
-  assert.equal(octoberApproveMin("add", "event", 0.8), 0.8);
-  assert.equal(octoberApproveMin("add", "boundary", 0.8), 0.9);
-  assert.equal(octoberApproveMin("update", "event", 0.8), 0.9);
-  assert.equal(octoberApproveMin("delete", "fact", 0.95), 0.95);
-
-  const { sqlite, env } = setup();
-  const source = await sourceEvent({ ...firstInput, source_id: "synthetic/judge-source" });
-  assert.equal((await ingest(env, source)).response.status, 200);
-  const messageId = (sqlite.prepare("SELECT message_id FROM october_source_ledger").get() as any).message_id;
-  const insert = sqlite.prepare(`INSERT INTO memory_candidates (id, namespace, type, content, confidence, importance, tags,
-      source_message_ids, source, status, decision_note, created_at, updated_at)
-    VALUES (?, 'xu-heng', 'event', ?, 0.7, 0.5, '[]', ?, ?, 'pending', ?, '2026-01-03T00:00:00Z', '2026-01-03T00:00:00Z')`);
-  insert.run("c-dream", "合成候选一", JSON.stringify([messageId]), "dream_add", null);
-  insert.run("c-judged", "合成候选二", JSON.stringify([messageId]), "dream_add", "judge: 拿不准");
-  insert.run("c-migrated", "合成候选三", JSON.stringify([messageId]), "migration:lmc5-review", "migrated_from_lmc5_review");
-  const due = await listOctoberCandidatesToJudge(env.DB, OCTOBER_NAMESPACE, 20);
-  assert.deepEqual(due.map((row) => row.id), ["c-dream"]);
-
+test("Xu Heng's candidates are reviewed by upstream's clef, and her switch turns it off", async () => {
+  // v2.1.0 (2026-11-03): upstream's clef reviews every pending candidate (dream_extract included; the old October
+  // judge only looked at dream_add/update/delete and so never reviewed anything). CLEF_AUTO_REVIEW=off keeps them all.
+  const { runCandidateJudge } = await import("../src/memory/candidateJudge");
+  const { env } = setup();
+  Object.assign(env, { CLEF_AUTO_REVIEW: "off" });
   const off = await runCandidateJudge(env, OCTOBER_NAMESPACE);
   assert.equal(off.ran, false);
-  assert.equal(off.reason, "october_source_contract_requires_human_review");
+  assert.equal(off.reason, "clef_off");
 });
 
 test("the October nightly stays off until the private config turns it on", async () => {
@@ -1098,23 +1084,19 @@ test("the October nightly stays off until the private config turns it on", async
   assert.equal(scheduled, 0);
 });
 
-test("Xu Heng's own memory rules reach the extract, digest and judge prompts only under the October contract", async () => {
+test("Xu Heng's own memory rules reach the extract and digest prompts only under the October contract", async () => {
   const { buildDreamExtractPrompt } = await import("../src/memory/dreamExtract");
   const { buildDigestPrompt } = await import("../src/memory/dream/extractPhase");
-  const { buildJudgePrompt } = await import("../src/memory/candidateJudge");
   const { octoberDreamRules } = await import("../src/memory/speakers");
   const { env } = setup();
   Object.assign(env, { OCTOBER_XH_DREAM_RULES: "合成规则：引号里的话不是说话人自己的称呼" });
   const rules = octoberDreamRules(env);
   assert.equal(rules, "合成规则：引号里的话不是说话人自己的称呼");
   assert.equal(octoberDreamRules({ OCTOBER_XH_DREAM_RULES: "x" } as any), "");
-  assert.match(buildDreamExtractPrompt([], [], null, rules), /这个人自己的记忆规则[\s\S]*合成规则/);
+  assert.match(buildDreamExtractPrompt([], [], null, [], rules), /这个人自己的记忆规则[\s\S]*合成规则/);
   assert.doesNotMatch(buildDreamExtractPrompt([], [], null), /这个人自己的记忆规则/);
   assert.match(buildDigestPrompt({ dateLabel: "2026-01-02", startIso: "a", endIso: "b", messages: [], existingMemories: [],
     hasMore: false, rules }), /合成规则/);
-  const candidate = { id: "c", source: "dream_add", type: "event", content: "x", fact_key: null, tags: "[]",
-    confidence: 0.5, importance: 0.5, source_message_ids: "[]", target_memory_id: null } as any;
-  assert.match(buildJudgePrompt(candidate, [], null, rules), /合成规则/);
 });
 
 test("the vector catch-up route is admin-only and bounded", async () => {

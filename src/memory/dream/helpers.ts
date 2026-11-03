@@ -26,6 +26,7 @@ import {
 } from "../vectorStore";
 import { isV2Enabled } from "../v2/recall";
 import { cleanMessageText } from "../../utils/sanitize";
+import { formatChatMaterial } from "../chatMaterial";
 
 export interface DigestMemoryUpdate {
   target_id: string;
@@ -93,7 +94,9 @@ export type DailyDigestSkipReason =
   | "no_messages"
   | "missing_model"
   | "model_error"
+  | "model_timeout"
   | "model_invalid_json"
+  | "extract_model_timeout"
   | "extract_model_error"
   | "extract_invalid_json"
   | "v2_disabled";
@@ -127,11 +130,13 @@ export type DailyDigestRunOptions = {
   force?: boolean;
   dryRun?: boolean;
   trigger?: DreamRunTrigger;
+  /** Internal durable-job identity; never accepted directly from an API request. */
+  runId?: string;
 };
 
 export interface DigestModelCallResult {
   digest: DailyDigestResult | null;
-  reason?: Extract<DailyDigestSkipReason, "missing_model" | "model_error" | "model_invalid_json">;
+  reason?: Extract<DailyDigestSkipReason, "missing_model" | "model_error" | "model_timeout" | "model_invalid_json">;
   model?: string;
   status?: number;
   finishReason?: string | null;
@@ -213,12 +218,7 @@ export function normalizeDigestResult(value: unknown): DailyDigestResult {
 }
 
 export function formatTranscript(messages: MessageRecord[], speakers: DreamSpeakers | null = null): string {
-  return messages
-    .map((message) => {
-      const role = speakerLabel(message.role, speakers, message.speaker);
-      return `[${message.id}][${message.created_at}][${role}] ${truncate(cleanMessageText(message.content), 700)}`;
-    })
-    .join("\n\n");
+  return formatChatMaterial(messages, (role, message) => speakerLabel(role, speakers, message.speaker), { floor: 700 });
 }
 
 export function formatExistingMemories(memories: MemoryApiRecord[]): string {

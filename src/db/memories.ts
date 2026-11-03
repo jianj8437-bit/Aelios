@@ -1,6 +1,7 @@
 import type { MemoryLifecycleRow, MemoryRecord } from "../types";
 import { deleteFtsRow, searchFtsIds, upsertMemoryFts } from "../memory/fts";
 import { lexicalHitScore } from "../memory/queryShape";
+import { saveMemoryRevision } from "./v2/revisions";
 import { newId } from "../utils/ids";
 import { nowIso } from "../utils/time";
 
@@ -17,6 +18,8 @@ export interface CreateMemoryInput {
   source?: string | null;
   sourceMessageIds?: string[];
   expiresAt?: string | null;
+  /** 导入的记忆带着原来的日期。updated_at 仍是现在：过期按 updated_at 算。 */
+  createdAt?: string | null;
 }
 
 export interface ListMemoryFilters {
@@ -66,7 +69,7 @@ export async function createMemory(db: D1Database, input: CreateMemoryInput): Pr
     vector_id: vectorId,
     last_recalled_at: null,
     recall_count: 0,
-    created_at: now,
+    created_at: input.createdAt || now,
     updated_at: now,
     expires_at: input.expiresAt ?? null
   };
@@ -270,8 +273,23 @@ export async function fetchMemoriesWithLifecycleByIds(
 
 export async function updateMemory(
   db: D1Database,
-  input: { namespace: string; id: string; patch: UpdateMemoryInput }
+  input: {
+    namespace: string;
+    id: string;
+    patch: UpdateMemoryInput;
+    // 改了正文时旧文本存一版 (memory_revisions)：谁改的、为什么。
+    revision?: { by?: string | null; reason?: string | null };
+  }
 ): Promise<MemoryRecord | null> {
+  if (input.patch.content !== undefined) {
+    await saveMemoryRevision(db, {
+      namespace: input.namespace,
+      memoryId: input.id,
+      nextContent: input.patch.content,
+      replacedBy: input.revision?.by ?? null,
+      reason: input.revision?.reason ?? "edit"
+    });
+  }
   const assignments: string[] = [];
   const binds: unknown[] = [];
 

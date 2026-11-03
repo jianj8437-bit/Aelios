@@ -5,6 +5,7 @@ import {
   upsertDailyLog
 } from "../../db/v2";
 import { getMemoryById } from "../../db/memories";
+import { WORLD_FACT_TYPE } from "../canonicalTypes";
 import type { Env, MessageRecord } from "../../types";
 import { readString } from "../../utils/parse";
 import type { ExtractedMemory } from "../extract";
@@ -101,7 +102,9 @@ export async function applyDreamV2(
           namespace,
           oldId: item.target_id,
           newContent: item.content,
-          newType: item.type ?? worldFactTarget.type,
+          // 世界知识被 dream 更新后还是世界知识 (dream 只会给 8 类里的 type)。
+          newType: worldFactTarget.type === WORLD_FACT_TYPE ? WORLD_FACT_TYPE : item.type ?? worldFactTarget.type,
+          allowWorldFact: true,
           newFactKey: worldFactTarget.factKey,
           importance: item.importance,
           confidence: item.confidence,

@@ -109,53 +109,99 @@ export async function createMemoryCandidate(
   return record;
 }
 
+// source 过滤：excludeSources 不要这些来源，onlySources 只要这些来源。
+// 导入的候选 (import_chat / import_entries) 数量可能上千，夜里的自动审、助手审核、日常审核队列都得在查询里就把它们排掉，
+// 不然取前 100 条全是导入的，日常候选永远轮不到。
+function sourceFilterSql(input: { excludeSources?: readonly string[]; onlySources?: readonly string[] }): {
+  sql: string;
+  binds: string[];
+} {
+  if (input.onlySources && input.onlySources.length > 0) {
+    return { sql: ` AND source IN (${input.onlySources.map(() => "?").join(", ")})`, binds: [...input.onlySources] };
+  }
+  if (input.excludeSources && input.excludeSources.length > 0) {
+    return { sql: ` AND source NOT IN (${input.excludeSources.map(() => "?").join(", ")})`, binds: [...input.excludeSources] };
+  }
+  return { sql: "", binds: [] };
+}
+
 export async function listMemoryCandidates(
   db: D1Database,
-  input: { namespace: string; status?: string; limit: number }
+  input: {
+    namespace: string;
+    status?: string;
+    limit: number;
+    excludeSources?: readonly string[];
+    onlySources?: readonly string[];
+  }
 ): Promise<MemoryCandidateRow[]> {
   const limit = Math.min(Math.max(Math.floor(input.limit), 1), 200);
   const status = input.status ?? "pending";
+  const filter = sourceFilterSql(input);
   const result = await db
     .prepare(
       `SELECT *
        FROM memory_candidates
-       WHERE namespace = ? AND status = ?
+       WHERE namespace = ? AND status = ?${filter.sql}
        ORDER BY confidence ASC, created_at DESC
        LIMIT ?`
     )
-    .bind(input.namespace, status, limit)
+    .bind(input.namespace, status, ...filter.binds, limit)
     .all<MemoryCandidateRow>();
   return result.results ?? [];
 }
 
 export async function countMemoryCandidates(
   db: D1Database,
-  input: { namespace: string; status?: string }
+  input: { namespace: string; status?: string; excludeSources?: readonly string[]; onlySources?: readonly string[] }
 ): Promise<number> {
   const status = input.status ?? "pending";
+  const filter = sourceFilterSql(input);
   const row = await db
-    .prepare("SELECT COUNT(*) AS count FROM memory_candidates WHERE namespace = ? AND status = ?")
-    .bind(input.namespace, status)
+    .prepare(`SELECT COUNT(*) AS count FROM memory_candidates WHERE namespace = ? AND status = ?${filter.sql}`)
+    .bind(input.namespace, status, ...filter.binds)
     .first<{ count: number }>();
   return row?.count ?? 0;
 }
 
 // 梦境收成 (dream harvest)：当天被判过 (approved / discarded) 的候选，按判决时间倒序。
+// excludeSources：导入的候选不是那晚的梦，收成页不列 (一批批完能有上千条)。
 export async function listJudgedCandidatesInRange(
   db: D1Database,
-  input: { namespace: string; startIso: string; endIso: string; limit?: number }
+  input: { namespace: string; startIso: string; endIso: string; limit?: number; excludeSources?: readonly string[] }
+): Promise<MemoryCandidateRow[]> {
+  const limit = Math.min(Math.max(Math.floor(input.limit ?? 200), 1), 500);
+  const filter = sourceFilterSql({ excludeSources: input.excludeSources });
+  const result = await db
+    .prepare(
+      `SELECT *
+       FROM memory_candidates
+       WHERE namespace = ? AND status IN ('approved', 'discarded')
+         AND updated_at >= ? AND updated_at < ?${filter.sql}
+       ORDER BY updated_at DESC
+       LIMIT ?`
+    )
+    .bind(input.namespace, input.startIso, input.endIso, ...filter.binds, limit)
+    .all<MemoryCandidateRow>();
+  return result.results ?? [];
+}
+
+// 自动审核的决定 (含撤回过的)，给后台"这周助手自己定的"清单用，按决定时间倒序。
+export async function listJudgeDecisionsSince(
+  db: D1Database,
+  input: { namespace: string; sinceIso: string; limit?: number }
 ): Promise<MemoryCandidateRow[]> {
   const limit = Math.min(Math.max(Math.floor(input.limit ?? 200), 1), 500);
   const result = await db
     .prepare(
       `SELECT *
        FROM memory_candidates
-       WHERE namespace = ? AND status IN ('approved', 'discarded')
-         AND updated_at >= ? AND updated_at < ?
+       WHERE namespace = ? AND status IN ('approved', 'discarded') AND updated_at >= ?
+         AND (decision_note LIKE 'judge%' OR decision_note LIKE 'undo: judge%')
        ORDER BY updated_at DESC
        LIMIT ?`
     )
-    .bind(input.namespace, input.startIso, input.endIso, limit)
+    .bind(input.namespace, input.sinceIso, limit)
     .all<MemoryCandidateRow>();
   return result.results ?? [];
 }

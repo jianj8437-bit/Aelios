@@ -1,21 +1,38 @@
-import { listActiveFactKeys } from "../db/v2";
-import type { DreamSpeakers } from "../gateway/config";
-import { loadSpeakersForNamespace, octoberDreamRules, personRulesSection, speakerLabel } from "./speakers";
-import { callOpenAICompat } from "../proxy/openaiAdapter";
+import { listActiveFactKeys, listDailyLogsInRange } from "../db/v2";
+import { loadConfig, speakersForNamespace, type DreamSpeakers } from "../gateway/config";
+import { callDreamModelJson, DreamModelTimeoutError } from "./dream/modelCall";
+import { loadSpeakersForNamespace, octoberDreamRules, personRulesSection } from "./speakers";
 import type { Env, MessageRecord, OpenAIChatRequest, OpenAIChatResponse } from "../types";
 import { clampScore, extractJsonObject, readString, readStringArray } from "../utils/parse";
-import { cleanMessageText } from "../utils/sanitize";
+import { CHAT_MATERIAL_RULES, clipMiddle, escapeChatTags, formatChatMaterial } from "./chatMaterial";
+import { addDaysToDateLabel } from "./dreamDates";
+import { readDreamTimeZoneFromEnv } from "./dreamEnv";
 import { clampMemoryType } from "./canonicalTypes";
+import { speakerLabel } from "./speakers";
 import type { ExtractedMemory } from "./extract";
 
-const DEFAULT_DREAM_EXTRACT_MAX_TOKENS = 1200;
+// Same budget as the digest call: a smaller extract cap truncated the candidate list (and any reasoning tokens) of a full batch.
+const DEFAULT_DREAM_EXTRACT_MAX_TOKENS = 3000;
+const MAX_DREAM_EXTRACT_MAX_TOKENS = 8000;
 const DEFAULT_WORKERS_AI_DREAM_MODEL = "workers-ai/@cf/openai/gpt-oss-120b";
 
-interface DreamExtractModelResult {
+export interface DreamExtractModelResult {
   memories: ExtractedMemory[];
   model?: string;
-  reason?: "missing_model" | "model_error" | "model_invalid_json";
+  reason?: "missing_model" | "model_error" | "model_timeout" | "model_invalid_json";
   status?: number;
+  /** 模型回的用量 (有就带上)。导入聊天记录要按段显示花了多少 token。 */
+  usage?: { input: number; output: number };
+  /** 模型回的 finish_reason；"length" 说明输出被截断了，可以把这段切小再来。 */
+  finishReason?: string | null;
+}
+
+function readUsage(usage: OpenAIChatResponse["usage"]): { input: number; output: number } | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const input = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0;
+  const output = Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0;
+  if (!input && !output) return undefined;
+  return { input, output };
 }
 
 function readPositiveInt(value: unknown, fallback: number, max: number): number {
@@ -53,20 +70,24 @@ function parseExtractModelOutput(text: string): ExtractedMemory[] | null {
   const parsed = extractJsonObject(text);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
   const raw = parsed as Record<string, unknown>;
-  const memories = Array.isArray(raw.memories) ? raw.memories : Array.isArray(raw.candidates) ? raw.candidates : [];
-  return memories.flatMap((item): ExtractedMemory[] => {
+  const memories = Array.isArray(raw.memories) ? raw.memories : Array.isArray(raw.candidates) ? raw.candidates : null;
+  // A missing/wrong-shaped list is not a valid empty extraction: never advance the cursor on it.
+  if (!memories) return null;
+  const kept = memories.flatMap((item): ExtractedMemory[] => {
     const candidate = normalizeCandidate(item);
     return candidate ? [candidate] : [];
   });
+  // Individual bad entries (blank, over-long, wrong type) are dropped and counted so one of them cannot stall the batch.
+  // Only a non-empty list in which nothing was usable is treated as malformed output rather than "nothing to remember".
+  if (memories.length > 0 && kept.length === 0) return null;
+  if (kept.length < memories.length) {
+    console.warn("dream extract: dropped unusable candidates", { dropped: memories.length - kept.length, kept: kept.length });
+  }
+  return kept;
 }
 
 function formatTranscript(messages: MessageRecord[], speakers: DreamSpeakers | null): string {
-  return messages
-    .map((message) => {
-      const role = speakerLabel(message.role, speakers, message.speaker);
-      return `[${message.id}][${message.created_at}][${role}] ${cleanMessageText(message.content).slice(0, 900)}`;
-    })
-    .join("\n\n");
+  return formatChatMaterial(messages, (role, message) => speakerLabel(role, speakers, message.speaker), { floor: 900 });
 }
 
 function speakerWritingRules(speakers: DreamSpeakers | null): string[] {
@@ -91,10 +112,34 @@ function exampleMemoryContent(speakers: DreamSpeakers | null): string {
   return `${speakers.userName}确定了九月按原计划卖掉那台车：买之前就约定只玩一年，这是${speakers.userName}给自己签的合同，不需要外人劝留。`;
 }
 
+export interface DiaryBackground {
+  date: string;
+  title: string;
+  summary: string;
+}
+
+// 前几天的日记当背景：抽取器只看当晚这批原文时，「那件事」「上次说的」指什么它看不懂。
+const DIARY_BACKGROUND_DAYS = 7;
+const DIARY_BACKGROUND_MAX_CHARS = 500;
+
+function backgroundSection(background: DiaryBackground[]): string[] {
+  if (background.length === 0) return [];
+  return [
+    "",
+    "前几天的日记（只是背景：用来看懂「那件事」「上次说的」指什么、前因后果是什么。不要从背景里抽新记忆，source_message_ids 只能来自 <chat> 里的消息）：",
+    "<background>",
+    ...background.map((entry) =>
+      `- ${entry.date}｜${escapeChatTags(entry.title)}：${escapeChatTags(clipMiddle(entry.summary, DIARY_BACKGROUND_MAX_CHARS))}`
+    ),
+    "</background>"
+  ];
+}
+
 export function buildDreamExtractPrompt(
   messages: MessageRecord[],
   existingFactKeys: string[] = [],
   speakers: DreamSpeakers | null = null,
+  background: DiaryBackground[] = [],
   rules = ""
 ): string {
   const factKeySection = existingFactKeys.length > 0
@@ -127,6 +172,7 @@ export function buildDreamExtractPrompt(
     "- type 只能从这 8 个里选：fact、event、preference、relationship、boundary、habit、decision、note。绝不输出 project、world_fact、commitment 等其他值；项目进展归 fact，承诺/决定归 decision，习惯归 habit。",
     "- 稳定事实必须尽量给 fact_key，格式为小写 ASCII，例如 preference:answer-style、boundary:no-system-records、decision:sell-car-2026-09。",
     "- 临时计划和意图不是稳定事实：要么提炼成背后的持久事实，要么直接跳过。",
+    ...CHAT_MATERIAL_RULES,
     "",
     "亲密 session（强制，不准跳过）：",
     "- 如果这批对话里出现了成段的亲密/性内容，除按普通规则抽取外，必须额外出 1 条 type=event 的「玩法记录」：清单式、不煽情，只记事实——玩法/动作/道具/角色框架/新开的边界/偏好或身体状态变化。",
@@ -157,6 +203,7 @@ export function buildDreamExtractPrompt(
     "",
     "如果没有值得长期保留的稳定事实，输出：",
     JSON.stringify({ memories: [] }),
+    ...backgroundSection(background),
     "",
     "对话：",
     formatTranscript(messages, speakers)
@@ -167,7 +214,9 @@ async function callDreamExtractModel(
   env: Env,
   messages: MessageRecord[],
   existingFactKeys: string[],
-  speakers: DreamSpeakers | null
+  speakers: DreamSpeakers | null,
+  background: DiaryBackground[],
+  deadlineAt?: number
 ): Promise<DreamExtractModelResult> {
   const model = readDreamExtractModel(env);
   if (!model) return { memories: [], reason: "missing_model" };
@@ -176,37 +225,79 @@ async function callDreamExtractModel(
     model,
     messages: [
       { role: "system", content: "你是严格的 JSON 生成器。你只输出 JSON。" },
-      { role: "user", content: buildDreamExtractPrompt(messages, existingFactKeys, speakers, octoberDreamRules(env)) }
+      { role: "user", content: buildDreamExtractPrompt(messages, existingFactKeys, speakers, background, octoberDreamRules(env)) }
     ],
-    temperature: 0,
-    max_tokens: readPositiveInt(env.DREAM_MAX_TOKENS, DEFAULT_DREAM_EXTRACT_MAX_TOKENS, 4000),
+    max_tokens: readPositiveInt(env.DREAM_MAX_TOKENS, DEFAULT_DREAM_EXTRACT_MAX_TOKENS, MAX_DREAM_EXTRACT_MAX_TOKENS),
     response_format: { type: "json_object" },
     stream: false
   };
 
   try {
-    const response = await callOpenAICompat(env, request);
+    const response = await callDreamModelJson(env, request,
+      deadlineAt === undefined ? undefined : Math.min(120_000, deadlineAt - Date.now()));
     if (!response.ok) return { memories: [], model, reason: "model_error", status: response.status };
-    const parsed = (await response.json()) as OpenAIChatResponse;
-    const message = parsed.choices?.[0]?.message as ({ content?: unknown; reasoning_content?: unknown }) | undefined;
+    const parsed = response.parsed;
+    const usage = readUsage(parsed?.usage);
+    const choice = parsed?.choices?.[0] as { finish_reason?: unknown } | undefined;
+    const finishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : null;
+    const message = parsed?.choices?.[0]?.message as ({ content?: unknown; reasoning_content?: unknown }) | undefined;
     const content = typeof message?.content === "string" ? message.content.trim() : "";
     const reasoning = typeof message?.reasoning_content === "string" ? message.reasoning_content.trim() : "";
     const memories = parseExtractModelOutput(content || reasoning);
-    if (!memories) return { memories: [], model, reason: "model_invalid_json" };
-    return { memories, model };
+    if (!memories) {
+      console.error("dream extract: invalid JSON or candidate shape", {
+        model, finishReason, contentChars: content.length, reasoningChars: reasoning.length
+      });
+      return { memories: [], model, reason: "model_invalid_json", usage, finishReason };
+    }
+    return { memories, model, usage, finishReason };
   } catch (error) {
     console.error("dream extract: model failed", { model, error });
-    return { memories: [], model, reason: "model_error" };
+    return { memories: [], model, reason: error instanceof DreamModelTimeoutError ? "model_timeout" : "model_error" };
+  }
+}
+
+async function loadDiaryBackground(env: Env, namespace: string, dateLabel: string): Promise<DiaryBackground[]> {
+  try {
+    const timeZone = readDreamTimeZoneFromEnv(env);
+    const rows = await listDailyLogsInRange(env.DB, {
+      namespace,
+      startDate: addDaysToDateLabel(dateLabel, -DIARY_BACKGROUND_DAYS, timeZone),
+      endDate: addDaysToDateLabel(dateLabel, -1, timeZone)
+    });
+    return rows.map((row) => ({ date: row.date, title: row.title, summary: row.summary }));
+  } catch (error) {
+    console.error("dream extract: failed to load diary background", { namespace, dateLabel, error });
+    return [];
   }
 }
 
 export async function extractDreamMemoriesFromMessages(
   env: Env,
-  input: { namespace: string; messages: MessageRecord[]; speakers?: DreamSpeakers | null }
+  input: {
+    namespace: string;
+    messages: MessageRecord[];
+    speakers?: DreamSpeakers | null;
+    dateLabel?: string;
+    /** 库里还没有、但同一批里已经用过的 fact_key (导入聊天记录时前几天抽出来还在待审的)，一起交给模型复用。 */
+    extraFactKeys?: string[];
+    /** false 就不拿前几天的日记当背景 (导入的旧聊天跟现在的日记对不上)。 */
+    diaryBackground?: boolean;
+    /** Internal extraction-phase budget, including batch reduction retries. */
+    deadlineAt?: number;
+  }
 ): Promise<DreamExtractModelResult> {
-  const existingFactKeys = await listActiveFactKeys(env.DB, { namespace: input.namespace });
+  const [activeFactKeys, background] = await Promise.all([
+    listActiveFactKeys(env.DB, { namespace: input.namespace }),
+    input.dateLabel && input.diaryBackground !== false
+      ? loadDiaryBackground(env, input.namespace, input.dateLabel)
+      : Promise.resolve([])
+  ]);
+  const existingFactKeys = input.extraFactKeys?.length
+    ? [...new Set([...activeFactKeys, ...input.extraFactKeys])]
+    : activeFactKeys;
   const speakers = input.speakers !== undefined
     ? input.speakers
     : await loadSpeakersForNamespace(env, input.namespace);
-  return callDreamExtractModel(env, input.messages, existingFactKeys, speakers);
+  return callDreamExtractModel(env, input.messages, existingFactKeys, speakers, background, input.deadlineAt);
 }

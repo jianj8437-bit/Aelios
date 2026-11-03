@@ -1,7 +1,7 @@
 import { clampMemoryType } from "../memory/canonicalTypes";
 import { getMemoryById } from "../db/memories";
 import { upsertMemoryEmbedding } from "../memory/embedding";
-import { deleteFtsRow, upsertMemoryFts, upsertMessageFts } from "../memory/fts";
+import { deleteFtsRow, upsertMemoryFts, insertMessageFts } from "../memory/fts";
 import type { Env } from "../types";
 import { sha256Hex } from "../utils/hash";
 import { nowIso } from "../utils/time";
@@ -528,11 +528,10 @@ export async function applyOctoberSourceEvent(
       // Each revision has its own message_id (octoberMessageId) and the batch above already removed
       // the previous revision's row, so there is nothing to replace: without the delete, one message
       // reads a few rows instead of the whole message_fts table (her free D1 plan, 2026-10-16).
-      const indexed = await upsertMessageFts(env.DB, {
+      const indexed = await insertMessageFts(env.DB, {
         namespace: OCTOBER_NAMESPACE,
         messageId: event.message_id,
-        content: event.content,
-        fresh: true
+        content: event.content
       });
       if (indexed && !(await sourceMessageIsCurrent(env.DB, event))) {
         await deleteFtsRow(env.DB, "message_fts", "message_id", event.message_id);

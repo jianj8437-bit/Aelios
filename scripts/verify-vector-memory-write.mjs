@@ -115,7 +115,9 @@ assert.match(digestSource, /async function selectDreamMemoryContext/);
 assert.match(digestSource, /existingMemories = await selectDreamMemoryContext\(env, \{/);
 assert.match(digestSource, /const results = await searchMemories\(env, \{/);
 assert.match(digestSource, /const page = await listMemoriesPage\(env\.DB, \{/);
-assert.match(digestSource, /modelResult\.reason !== "model_invalid_json" \|\| modelResult\.finishReason !== "length"/);
+// Both stages now reduce together on invalid JSON/schema, including providers that report "stop" on truncation.
+assert.match(digestSource, /const invalidJson = modelResult\.reason === "model_invalid_json" \|\| extractResult\?\.reason === "model_invalid_json"/);
+assert.match(digestSource, /reductions < MAX_BATCH_REDUCTIONS && Date\.now\(\) < deadlineAt/);
 assert.match(digestSource, /messages = messages\.slice\(0, nextSize\);/);
 
 assert.match(recallSource, /function readRecallMinScore\(env: Env, override\?: number\): number/);
@@ -129,7 +131,7 @@ assert.match(recallSource, /const beforeFloor = \[\.\.\.afterRelation, \.\.\.lon
 assert.match(recallSource, /if \(\(hit\.raw_score \?\? hit\.score\) >= minScore\) return true;\s+flooredIds\.push\(hit\.id\);/s);
 assert.match(recallSource, /raw_score: rawScore,/);
 assert.match(recallSource, /floored_ids: flooredIds,\s+floored_count: flooredIds\.length,\s+min_score: minScore,/s);
-assert.match(mcpSource, /min_score: \{ type: "number", minimum: 0, maximum: 1 \}/);
+assert.match(mcpSource, /min_score: \{\s*type: "number",\s*minimum: 0,\s*maximum: 1\b/);
 assert.match(mcpSource, /min_score: typeof args\.min_score === "number" \? readNumber\(args\.min_score, 0\.15\) : undefined/);
 assert.match(wranglerSource, /crons = \["10 20 \* \* \*"\]/);
 assert.match(wranglerSource, /DREAM_MODEL = "workers-ai\/@cf\/openai\/gpt-oss-120b"/);
@@ -143,7 +145,7 @@ assert.match(dreamExtractSource, /export function buildDreamExtractPrompt/);
 assert.match(dreamExtractSource, /export async function extractDreamMemoriesFromMessages/);
 assert.match(digestSource, /source: "dream_extract"/);
 assert.match(digestSource, /buildDreamRoutingPlan/);
-assert.match(mcpSource, /name: "diary_get"/);
+assert.match(mcpSource, /name: "read_diary"/);
 assert.match(mcpSource, /is deprecated in v3; digest lives in the client system prompt/);
 assert.match(dbV2Source, /await db\.batch\(\[ensureLifecycle, markSeen\]\);/);
 assert.match(dbV2Source, /export async function fetchLongtailByIds/);
@@ -181,8 +183,9 @@ assert.match(dreamExtractSource, /type: clampMemoryType\(readString\(raw\.type\)
 assert.match(dreamExtractSource, /type 只能从这 8 个里选/);
 assert.match(dbV2Source, /import \{ clampMemoryType \} from "(?:\.\.\/)+memory\/canonicalTypes"/);
 assert.match(dbV2Source, /clampMemoryType\(input\.type, "note"\)/);
-assert.match(dbV2Source, /clampMemoryType\(input\.type, "fact"\)/);
-assert.match(dbV2Source, /clampMemoryType\(input\.newType, "fact"\)/);
+// memories.ts writes through storedMemoryType: the eight, plus world_fact only where a caller asks for it.
+assert.match(dbV2Source, /storedMemoryType\(input\.type, "fact", input\.allowWorldFact\)/);
+assert.match(dbV2Source, /storedMemoryType\(input\.newType, "fact", input\.allowWorldFact\)/);
 assert.match(source, /import \{ clampMemoryType \} from "\.\/canonicalTypes"/);
 assert.match(source, /type: clampMemoryType\(input\.type, "note"\),/);
 assert.match(memoriesApiSource, /clampMemoryType\(readString\(body\.type\), "note"\)/);
@@ -193,11 +196,8 @@ assert.doesNotMatch(dbV2Source, /input\.newType \?\? "world_fact"/);
 assert.match(digestSource, /memories_to_add 默认给空数组/);
 assert.doesNotMatch(digestSource, /for \(const memory of digest\.memories_to_add \?\? \[\]\) \{\s+const factKey/s);
 assert.doesNotMatch(digestSource, /added \+= 0/);
-assert.match(candidateJudgeSource, /export function decideJudge/);
+assert.match(candidateJudgeSource, /export function decideClef/);
 assert.match(candidateJudgeSource, /source === "dream_delete"/);
-assert.match(candidateJudgeSource, /parseJudgeBoolean/);
-assert.match(candidateJudgeSource, /shouldDelete === true && result\.score >= thresholds\.approveMin/);
-assert.match(candidateJudgeSource, /normalized === "false"/);
-assert.doesNotMatch(candidateJudgeSource, /grounded: Boolean\(obj\.grounded\)/);
+assert.match(candidateJudgeSource, /shouldDelete === true && result\.score >= REMEMBER_MIN/);
 
 console.log("verify-vector-memory-write: all checks passed");

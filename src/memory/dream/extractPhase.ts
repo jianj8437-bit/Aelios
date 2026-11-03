@@ -1,6 +1,7 @@
-import { callOpenAICompat } from "../../proxy/openaiAdapter";
-import type { Env, MemoryApiRecord, MessageRecord, OpenAIChatRequest, OpenAIChatResponse } from "../../types";
+import type { Env, MemoryApiRecord, MessageRecord, OpenAIChatRequest } from "../../types";
+import { callDreamModelJson, DreamModelTimeoutError } from "./modelCall";
 import { extractJsonObject } from "../../utils/parse";
+import { CHAT_MATERIAL_RULES } from "../chatMaterial";
 import { extractDreamMemoriesFromMessages } from "../dreamExtract";
 import { readDreamMaxTokens, readDreamModel } from "../dreamEnv";
 import type { ExtractedMemory } from "../extract";
@@ -15,6 +16,8 @@ import {
 } from "./helpers";
 
 const DREAM_MODEL_RETRY_BACKOFF_MS = [2000, 8000];
+const MAX_BATCH_REDUCTIONS = 3;
+const EXTRACT_PHASE_BUDGET_MS = 8 * 60_000;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -65,6 +68,7 @@ export function buildDigestPrompt(input: {
     speakerRule,
     ...personRulesSection(input.rules ?? ""),
     "- 不要提到 D1、Vectorize、RAG、数据库、记忆系统、代理层等实现细节。",
+    ...CHAT_MATERIAL_RULES,
     "",
     "Dream 输出格式：",
     "- title 是 12 字以内标题。",
@@ -76,12 +80,12 @@ export function buildDigestPrompt(input: {
     "- memories_to_delete 只删除空、重复、明显过期或被新信息否定的旧记忆。",
     "- 控制总输出长度，宁可少写也不要输出超长 JSON。",
     "",
-    "输出 JSON 结构：",
+    "输出 JSON 结构（尖括号里只说明该填什么，不是示例内容，不要照抄；title 和 summary 要写这一批原文实际发生的事）：",
     JSON.stringify({
       date: input.dateLabel,
-      title: "夜间整理",
-      summary: "这次 dream 合并了重复记忆，更新了项目状态。",
-      sections: [{ heading: "整理结果", content: "……" }],
+      title: "<12 字以内标题>",
+      summary: "<一段话：这一批聊了什么、这次整理实际做了什么；没有改动就如实写没有改动>",
+      sections: [{ heading: "<小标题>", content: "<正文>" }],
       memories_to_add: [],
       memories_to_update: [
         {
@@ -104,10 +108,37 @@ export function buildDigestPrompt(input: {
   ].join("\n");
 }
 
+const DIGEST_LIST_KEYS = ["sections", "memories_to_add", "memories_to_update", "memories_to_delete"] as const;
+
+/** A list field of the wrong type means the model ignored the format; a missing one is simply empty. */
+function digestListsWellFormed(raw: DailyDigestResult): boolean {
+  return DIGEST_LIST_KEYS.every((key) => raw[key] == null || Array.isArray(raw[key]));
+}
+
+/**
+ * Entries that cannot be used (blank, wrong type, an update that changes nothing) are dropped and counted rather than
+ * failing the batch: they would never have been applied, and rejecting the whole night over one kept the cursor stuck.
+ */
+function sanitizeDigestItems(raw: DailyDigestResult): { digest: DailyDigestResult; dropped: number } {
+  const normalized = normalizeDigestResult(raw);
+  const digest = normalized.memories_to_update
+    ? {
+        ...normalized,
+        memories_to_update: normalized.memories_to_update.filter((item) =>
+          [item.content, item.type, item.importance, item.confidence, item.tags].some((value) => value !== undefined))
+      }
+    : normalized;
+  const dropped = DIGEST_LIST_KEYS.reduce(
+    (sum, key) => sum + Math.max(0, (raw[key]?.length ?? 0) - (digest[key]?.length ?? 0)),
+    0
+  );
+  return { digest, dropped };
+}
+
 export async function callDigestModel(
   env: Env,
   prompt: string,
-  meta: { dateLabel: string; messageCount: number; memoryCount: number; hasMore: boolean }
+  meta: { dateLabel: string; messageCount: number; memoryCount: number; hasMore: boolean; deadlineAt?: number }
 ): Promise<DigestModelCallResult> {
   const model = readDreamModel(env);
   if (!model) {
@@ -121,7 +152,6 @@ export async function callDigestModel(
       { role: "system", content: "你是严格的 JSON 生成器。你只输出 JSON，不要输出思考过程。" },
       { role: "user", content: prompt }
     ],
-    temperature: 0,
     max_tokens: readDreamMaxTokens(env),
     response_format: {
       type: "json_object"
@@ -143,6 +173,9 @@ export async function callDigestModel(
   const maxAttempts = 1 + DREAM_MODEL_RETRY_BACKOFF_MS.length;
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    if (meta.deadlineAt !== undefined && meta.deadlineAt <= Date.now()) {
+      return { digest: null, reason: "model_timeout", model };
+    }
     if (attempt > 0) {
       const backoffMs = DREAM_MODEL_RETRY_BACKOFF_MS[attempt - 1] ?? DREAM_MODEL_RETRY_BACKOFF_MS.at(-1) ?? 8000;
       console.warn("dream: retrying model call after non-ok response", {
@@ -152,11 +185,15 @@ export async function callDigestModel(
         maxAttempts,
         backoffMs
       });
+      if (meta.deadlineAt !== undefined && Date.now() + backoffMs >= meta.deadlineAt) {
+        return { digest: null, reason: "model_timeout", model };
+      }
       await delay(backoffMs);
     }
 
     try {
-      const response = await callOpenAICompat(env, request);
+      const response = await callDreamModelJson(env, request,
+        meta.deadlineAt === undefined ? undefined : Math.min(120_000, meta.deadlineAt - Date.now()));
       const elapsedMs = Date.now() - startedAt;
       if (!response.ok) {
         const retriable = isRetriableModelStatus(response.status);
@@ -172,13 +209,16 @@ export async function callDigestModel(
         if (retriable && attempt < maxAttempts - 1) continue;
         return { digest: null, reason: "model_error", model, status: response.status };
       }
-      const parsed = (await response.json()) as OpenAIChatResponse;
-      const choice = parsed.choices?.[0];
+      const choice = response.parsed?.choices?.[0];
       const message = choice?.message as ({ content?: unknown; reasoning_content?: unknown }) | undefined;
       const content = typeof message?.content === "string" ? message.content.trim() : "";
       const reasoning = typeof message?.reasoning_content === "string" ? message.reasoning_content.trim() : "";
       const json = extractJsonObject(content || reasoning);
-      if (!json) {
+      const shape = json as DailyDigestResult | null;
+      if (!shape || typeof shape !== "object" || Array.isArray(shape)
+        || typeof shape.title !== "string" || !shape.title.trim()
+        || typeof shape.summary !== "string" || !shape.summary.trim()
+        || !digestListsWellFormed(shape)) {
         console.error("dream: model returned invalid JSON", {
           date: meta.dateLabel,
           model,
@@ -189,6 +229,10 @@ export async function callDigestModel(
         });
         return { digest: null, reason: "model_invalid_json", model, finishReason: choice?.finish_reason };
       }
+      const { digest, dropped } = sanitizeDigestItems(shape);
+      if (dropped > 0) {
+        console.warn("dream: dropped unusable digest entries", { date: meta.dateLabel, model, dropped });
+      }
       console.log("dream: model returned valid JSON", {
         date: meta.dateLabel,
         model,
@@ -198,7 +242,7 @@ export async function callDigestModel(
         reasoningChars: reasoning.length,
         attempt: attempt + 1
       });
-      return { digest: normalizeDigestResult(json), model };
+      return { digest, model };
     } catch (error) {
       const elapsedMs = Date.now() - startedAt;
       const message = error instanceof Error && error.message ? error.message : String(error);
@@ -209,7 +253,8 @@ export async function callDigestModel(
         attempt: attempt + 1,
         error: message
       });
-      // Thrown fetch errors are almost always network-level and worth retrying.
+      // A deadline is not automatically retried: the provider may still be completing a billed request.
+      if (error instanceof DreamModelTimeoutError) return { digest: null, reason: "model_timeout", model };
       if (attempt < maxAttempts - 1) continue;
       return { digest: null, reason: "model_error", model };
     }
@@ -218,7 +263,7 @@ export async function callDigestModel(
   return { digest: null, reason: "model_error", model };
 }
 
-/** Run digest model (with length-truncation shrink) then dream extract on the same batch. */
+/** Run digest and extraction on exactly the same batch; only a fully valid batch may advance the cursor. */
 export async function runExtractPhase(
   env: Env,
   input: {
@@ -235,13 +280,15 @@ export async function runExtractPhase(
   hasMore: boolean;
   modelResult: DigestModelCallResult;
   extractedMemories: ExtractedMemory[];
-  extractReason?: "model_error" | "model_invalid_json" | "missing_model";
+  extractReason?: "model_error" | "model_timeout" | "model_invalid_json" | "missing_model";
   extractModel?: string;
   extractStatus?: number;
+  extractFinishReason?: string | null;
 }> {
   let messages = input.messages;
   let hasMore = input.hasMore;
-  let modelResult: DigestModelCallResult;
+  let reductions = 0;
+  const deadlineAt = Date.now() + EXTRACT_PHASE_BUDGET_MS;
   const speakers = await loadSpeakersForNamespace(env, input.namespace);
 
   for (;;) {
@@ -255,51 +302,48 @@ export async function runExtractPhase(
       speakers,
       rules: octoberDreamRules(env)
     });
-    modelResult = await callDigestModel(env, prompt, {
+    const modelResult = await callDigestModel(env, prompt, {
       dateLabel: input.dateLabel,
       messageCount: messages.length,
       memoryCount: input.existingMemories.length,
-      hasMore
+      hasMore,
+      deadlineAt
     });
-    if (modelResult.digest) break;
-    if (modelResult.reason !== "model_invalid_json" || modelResult.finishReason !== "length" || messages.length <= 1) break;
-
-    const nextSize = Math.max(1, Math.floor(messages.length / 2));
-    if (nextSize >= messages.length) break;
-    console.warn("dream: retrying with smaller batch after length-truncated JSON", {
-      date: input.dateLabel,
-      previousMessageCount: messages.length,
-      nextMessageCount: nextSize,
-      model: modelResult.model
-    });
-    messages = messages.slice(0, nextSize);
-    hasMore = true;
-  }
-
-  if (!modelResult.digest) {
+    let extractResult: Awaited<ReturnType<typeof extractDreamMemoriesFromMessages>> | undefined;
+    if (modelResult.digest) {
+      extractResult = await extractDreamMemoriesFromMessages(env, {
+        namespace: input.namespace,
+        messages,
+        speakers,
+        dateLabel: input.dateLabel,
+        deadlineAt
+      });
+    }
+    const invalidJson = modelResult.reason === "model_invalid_json" || extractResult?.reason === "model_invalid_json";
+    if (invalidJson && messages.length > 1 && reductions < MAX_BATCH_REDUCTIONS && Date.now() < deadlineAt) {
+      const nextSize = Math.max(1, Math.floor(messages.length / 2));
+      console.warn("dream: retrying both stages on a smaller batch after invalid JSON", {
+        date: input.dateLabel,
+        phase: modelResult.digest ? "extract" : "digest",
+        previousMessageCount: messages.length,
+        nextMessageCount: nextSize
+      });
+      messages = messages.slice(0, nextSize);
+      hasMore = true;
+      reductions += 1;
+      continue;
+    }
     return {
       messages,
       hasMore,
       modelResult,
-      extractedMemories: []
+      extractedMemories: extractResult?.memories ?? [],
+      extractReason: extractResult?.reason,
+      extractModel: extractResult?.model,
+      extractStatus: extractResult?.status,
+      extractFinishReason: extractResult?.finishReason
     };
   }
-
-  const extractResult = await extractDreamMemoriesFromMessages(env, {
-    namespace: input.namespace,
-    messages,
-    speakers
-  });
-
-  return {
-    messages,
-    hasMore,
-    modelResult,
-    extractedMemories: extractResult.memories,
-    extractReason: extractResult.reason,
-    extractModel: extractResult.model,
-    extractStatus: extractResult.status
-  };
 }
 
 // Keep DailyDigestResult type re-export for local consumers if needed

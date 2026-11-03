@@ -25,12 +25,44 @@ export interface ModelCallRequest {
 
 export class ModelCallError extends Error {
   readonly status?: number;
+  // What the upstream said, e.g. "3036: You have used up your daily free allocation".
+  // A Workers AI failure always reaches us as a bare 500, so this is the only place
+  // the actual reason survives.
+  readonly detail?: string;
 
-  constructor(message: string, status?: number) {
-    super(message);
+  constructor(message: string, status?: number, detail?: string) {
+    super(detail ? `${message}: ${detail}` : message);
     this.name = "ModelCallError";
     this.status = status;
+    this.detail = detail;
   }
+}
+
+const ERROR_DETAIL_MAX_CHARS = 500;
+
+// Pull the error text out of a non-ok response: the `error.message` of a JSON body
+// when there is one, otherwise the raw text, clipped.
+export async function readModelErrorDetail(response: Response): Promise<string | undefined> {
+  let text: string;
+  try {
+    text = (await response.text()).trim();
+  } catch {
+    return undefined;
+  }
+  if (!text) return undefined;
+  try {
+    const parsed = JSON.parse(text) as { error?: unknown; errors?: unknown };
+    const error = parsed.error;
+    if (typeof error === "string" && error.trim()) text = error.trim();
+    else if (error && typeof error === "object" && typeof (error as { message?: unknown }).message === "string") {
+      text = (error as { message: string }).message.trim() || text;
+    } else if (Array.isArray(parsed.errors) && parsed.errors.length > 0) {
+      text = JSON.stringify(parsed.errors);
+    }
+  } catch {
+    // not JSON; keep the raw text
+  }
+  return text.length > ERROR_DETAIL_MAX_CHARS ? `${text.slice(0, ERROR_DETAIL_MAX_CHARS)}…` : text;
 }
 
 /**
@@ -67,7 +99,6 @@ export async function callModelWithRetry(env: Env, req: ModelCallRequest): Promi
       { role: "system", content: req.systemPrompt ?? DEFAULT_SYSTEM_PROMPT },
       { role: "user", content: req.prompt }
     ],
-    temperature: 0,
     ...(req.maxTokens !== undefined ? { max_tokens: req.maxTokens } : {}),
     response_format: { type: "json_object" },
     stream: false
@@ -91,17 +122,19 @@ export async function callModelWithRetry(env: Env, req: ModelCallRequest): Promi
       const elapsedMs = Date.now() - startedAt;
       if (!response.ok) {
         const retriable = isRetriableModelStatus(response.status);
+        const detail = await readModelErrorDetail(response);
         console.error(`${logPrefix}: model returned non-ok`, {
           ...req.logMeta,
           model: req.model,
           status: response.status,
           statusText: response.statusText,
+          detail,
           elapsedMs,
           attempt: attempt + 1,
           retriable
         });
         if (retriable && attempt < maxAttempts - 1) continue;
-        throw new ModelCallError(`model returned status ${response.status}`, response.status);
+        throw new ModelCallError(`model returned status ${response.status}`, response.status, detail);
       }
 
       const parsed = (await response.json()) as OpenAIChatResponse;

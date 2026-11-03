@@ -6,10 +6,14 @@ import { timingSafeEqual } from "node:crypto";
 import worker from "../src/index";
 import { identityNamespace, identityReadNamespaces, invalidateSettingsCache, speakersForNamespace, validateConfig } from "../src/gateway/config";
 import { appendMemory, classifyTurn, canonical } from "../src/gateway/protocol";
-import { catalogUrl, resolveUpstream, routeFor, rejectedToolFields } from "../src/gateway/upstream";
+import { catalogUrl, nativeAnthropic, resolveUpstream, routeFor, rejectedToolFields } from "../src/gateway/upstream";
 import { OutputCollector, observeResponse, persistExchange, prepareExchange, dispatchExchange } from "../src/gateway/record";
+import { getOrCreateConversation } from "../src/db/conversations";
+import { saveUserMessages } from "../src/db/messages";
+import { backfillFts } from "../src/memory/fts";
 
 import { lexicalOverlapScore, shapeRecallQuery } from "../src/memory/queryShape";
+import { codingClient, codingSpeech, isSpeechTool, stripCodeBlocks } from "../src/gateway/coding";
 
 // Test production modules and SQL with deterministic HTTP and Workers AI doubles.
 (crypto.subtle as any).timingSafeEqual = (a: Uint8Array, b: Uint8Array) => timingSafeEqual(a, b);
@@ -108,6 +112,41 @@ test("migrations, native chat recall, namespace isolation, original text and Que
   await run("/v1/chat/completions", continuation);
   assert.deepEqual(calls[1].query.messages, continuation.messages);
   assert.equal(queue[1].kind, "tool"); assert.equal(queue[1].userText, "");
+});
+
+// message_id is UNINDEXED in FTS5: `DELETE FROM message_fts WHERE message_id = ?` reads the whole
+// table, and D1 bills every row. Recording a turn must not pay that on every request.
+function spySql(): string[] {
+  const seen: string[] = [];
+  const base = env.DB;
+  env.DB = { ...base, prepare(sql: string) { seen.push(sql); return base.prepare(sql); } };
+  return seen;
+}
+const ftsScans = (seen: string[]) => seen.filter(sql => /DELETE FROM (message|memory)_fts WHERE (message|memory)_id = \?/.test(sql));
+
+test("recording a turn indexes each new message once without scanning the FTS table", async () => {
+  const seen = spySql();
+  await run("/v1/chat/completions", { model: "partner", messages: [{ role: "user", content: "今晚想吃火锅" }] });
+  await persistExchange(env, queue[0]); await persistExchange(env, queue[0]);
+  assert.deepEqual(ftsScans(seen), []);
+  const indexed = (sqlite.prepare("SELECT message_id FROM message_fts").all() as any[]).map(row => row.message_id).sort();
+  assert.deepEqual(indexed, [queue[0].userId, `${queue[0].id}:assistant`].sort());
+});
+
+test("FTS backfill indexes missing rows without per-row FTS scans", async () => {
+  sqlite.prepare("INSERT INTO conversations (id, namespace, created_at, updated_at) VALUES ('c', 'partner-a', 'x', 'x')").run();
+  for (const [id, content] of [["m-old", "已经有索引的话"], ["m-new", "还没有索引的话"]]) {
+    sqlite.prepare(`INSERT INTO messages (id, conversation_id, namespace, role, content, source, stream, created_at, seq)
+      VALUES (?, 'c', 'partner-a', 'user', ?, 'test', 0, '2026-10-28T00:00:00.000Z', 0)`).run(id, content);
+  }
+  sqlite.prepare("INSERT INTO message_fts (fts_body, namespace, message_id) VALUES ('已经', 'partner-a', 'm-old')").run();
+  const seen = spySql();
+  const result = await backfillFts(env.DB, { namespace: "partner-a", limit: 10 });
+  assert.equal(result.messagesIndexed, 1);
+  assert.deepEqual(ftsScans(seen), []);
+  assert.ok(seen.every(sql => !/LEFT JOIN (message|memory)_fts/.test(sql)));
+  const ids = (sqlite.prepare("SELECT message_id FROM message_fts").all() as any[]).map(row => row.message_id).sort();
+  assert.deepEqual(ids, ["m-new", "m-old"]);
 });
 
 function seedQuote(namespace: string, id: string, role: "user" | "assistant", content: string) {
@@ -757,6 +796,64 @@ test("messages on CF strips the provider prefix and carries the token as cf-aig-
   assert.equal(calls[0].headers["anthropic-version"], "2023-06-01");
 });
 
+test("default thinking mode keeps the tool loop after an injected turn working on Anthropic's own line", async () => {
+  // 2026-10-08: remember called right after a recalled turn, the continuation came back 400
+  // "Invalid signature in thinking block. The block is bound to a different conversation".
+  precious("partner-a", "Cloudflare fan");
+  const plain: any = identity();
+  delete plain.anthropicThinking;
+  setConfig({ ...config([plain]), upstream: { address: "e".repeat(32) } });
+  const user = { role: "user", content: "Cloudflare" };
+  const body = { model: "anthropic/claude-opus-5-5", max_tokens: 2048, messages: [user] };
+  await run("/v1/messages", body);
+  assert.match(calls[0].query.messages[0].content, /Cloudflare fan/);
+  assert.equal(calls[0].query.thinking, undefined);
+  assert.equal(calls[0].headers["anthropic-beta"], undefined);
+  const generated = { role: "assistant", content: [{ type: "thinking", thinking: "", signature: "bound-to-injected-prefix" },
+    { type: "tool_use", id: "r", name: "remember", input: { content: "fact" } }] };
+  const continuation = { ...body, messages: [user, generated, { role: "user", content: [{ type: "tool_result", tool_use_id: "r", content: "saved" }] }] };
+  await run("/v1/messages", continuation);
+  assert.deepEqual(calls[1].query.messages, continuation.messages);
+  assert.deepEqual(calls[1].query.thinking, { type: "adaptive", block_binding: { prefix_mismatch_behavior: "drop_block" } });
+  assert.match(calls[1].headers["anthropic-beta"], /thinking-binding-controls-2026-08-01/);
+  // The same identity on a relay line is left as the client sent it.
+  setConfig(config([plain]));
+  await run("/v1/messages", { ...continuation, model: "partner", thinking: { type: "adaptive" } });
+  assert.deepEqual(calls[2].query.thinking, { type: "adaptive" });
+  assert.equal(calls[2].headers["anthropic-beta"], undefined);
+  const resolved = resolveUpstream({} as any, { version: 3, upstream: { address: "e".repeat(32) }, identities: [] });
+  assert.equal(nativeAnthropic(routeFor(resolved, "messages", "anthropic/claude-opus-5-5")), true);
+  for (const model of ["google-vertex-ai/claude-opus-5-5", "custom-navy/claude-opus-5-5", "openrouter/anthropic/claude-opus-5-5"]) {
+    assert.equal(nativeAnthropic(routeFor(resolved, "messages", model)), false, model);
+  }
+});
+
+test("a model that refuses the guessed thinking gets the request exactly as the client sent it", async () => {
+  // Opus wrote the signed history, then the chat switched to a model without adaptive thinking.
+  const plain: any = { ...identity(), models: ["*haiku*"] };
+  delete plain.anthropicThinking;
+  setConfig({ ...config([plain]), upstream: { address: "e".repeat(32) } });
+  const mock = globalThis.fetch;
+  globalThis.fetch = async (url: any, init: any) => {
+    const query = JSON.parse(init.body);
+    if (query.thinking?.type === "adaptive") {
+      calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init.headers)), query });
+      return Response.json({ type: "error", error: { type: "invalid_request_error", message: "adaptive thinking is not supported on this model" } }, { status: 400 });
+    }
+    return mock(url, init);
+  };
+  const body = { model: "anthropic/claude-haiku-4-5", max_tokens: 64, messages: [{ role: "user", content: "hi" },
+    { role: "assistant", content: [{ type: "thinking", thinking: "", signature: "opus" }, { type: "text", text: "hello" }] },
+    { role: "user", content: "again" }] };
+  const { response } = await run("/v1/messages", body, { "anthropic-beta": "client-beta" });
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].query.thinking.type, "adaptive");
+  assert.equal(calls[1].query.thinking, undefined);
+  assert.equal(calls[1].headers["anthropic-beta"], "client-beta");
+  assert.deepEqual(calls[1].query.messages.slice(0, 2), body.messages.slice(0, 2));
+});
+
 test("any provider gets a native messages/responses route; prefixless models are refused before any upstream call", async () => {
   setConfig({ ...config(), upstream: { address: "d".repeat(32) } });
   await run("/v1/messages", { model: "openrouter/anthropic/claude-haiku-4.5", max_tokens: 16, messages: [{ role: "user", content: "Hi" }] });
@@ -785,11 +882,48 @@ test("settings edited in the admin page override deployment vars everywhere", as
   const report = JSON.parse((await run("/api/gateway/env")).text);
   const items = report.groups.flatMap((g: any) => g.items);
   assert.deepEqual(items.find((i: any) => i.name === "CHAT_MODEL").value, "chosen-in-admin");
-  assert.deepEqual(items.find((i: any) => i.name === "VISION_MODEL"), { name: "VISION_MODEL", label: "看图模型", hint: "", value: "", deployed: "deployed-vision" });
+  assert.deepEqual(items.find((i: any) => i.name === "VISION_MODEL"), { name: "VISION_MODEL", label: "看图模型", hint: "", labelEn: "Model for images", hintEn: "", value: "", deployed: "deployed-vision" });
+  assert.equal(report.groups.find((g: any) => g.group === "模型与线路").groupEn, "Models & routing");
   assert.equal(report.secrets.find((x: any) => x.name === "CHATBOX_API_KEY").present, true);
   assert.equal(report.secrets.find((x: any) => x.name === "DEBUG_API_KEY").present, false);
   assert.equal((await worker.fetch(request("/api/gateway/env", undefined, { authorization: "Bearer im-key" }), env, ctx)).status, 401);
   assert.throws(() => validateConfig({ ...config(), settings: { DB: "hijacked" } }), /Unknown setting/);
+});
+
+test("settings page saves one item at a time without touching the rest of the config", async () => {
+  const start = { ...config(), upstream: { address: "https://keep.test/v1" }, settings: { CHAT_MODEL: "kept", DREAM_MODEL: "old-dream" } };
+  assert.equal((await worker.fetch(request("/api/gateway/config", start, {}, "PUT"), env, ctx)).status, 200);
+  // One switch flipped: only that key changes; "" drops a key back to the deployed value.
+  const patched = await worker.fetch(request("/api/gateway/config", { settings: { CLEF_AUTO_REVIEW: "true", DREAM_MODEL: "" } }, {}, "PATCH"), env, ctx);
+  assert.equal(patched.status, 200);
+  assert.deepEqual((await patched.json() as any).settings, { CHAT_MODEL: "kept", CLEF_AUTO_REVIEW: "true" });
+  let saved = JSON.parse((await run("/api/gateway/config")).text);
+  assert.deepEqual(saved.settings, { CHAT_MODEL: "kept", CLEF_AUTO_REVIEW: "true" });
+  assert.equal(saved.upstream.address, "https://keep.test/v1");
+  assert.equal(saved.identities[0].slug, "partner");
+  // Saving the assistants leaves every setting alone; upstream: null removes it.
+  const renamed = [{ ...identity(), userName: "小南" }];
+  assert.equal((await worker.fetch(request("/api/gateway/config", { identities: renamed, upstream: null }, {}, "PATCH"), env, ctx)).status, 200);
+  saved = JSON.parse((await run("/api/gateway/config")).text);
+  assert.deepEqual(saved.settings, { CHAT_MODEL: "kept", CLEF_AUTO_REVIEW: "true" });
+  assert.equal(saved.identities[0].userName, "小南");
+  assert.equal(saved.upstream, undefined);
+  // Bad patches are refused whole and change nothing.
+  for (const bad of [{ settings: { DB: "hijacked" } }, { identities: "nope" }, [1]]) {
+    assert.equal((await worker.fetch(request("/api/gateway/config", bad, {}, "PATCH"), env, ctx)).status, 400);
+  }
+  assert.deepEqual(JSON.parse((await run("/api/gateway/config")).text).settings, { CHAT_MODEL: "kept", CLEF_AUTO_REVIEW: "true" });
+  assert.equal((await worker.fetch(request("/api/gateway/config", { settings: {} }, { authorization: "Bearer im-key" }, "PATCH"), env, ctx)).status, 401);
+  // The env report tells the page which items are switches, their code default, and which are everyday ones.
+  invalidateSettingsCache();
+  const items = JSON.parse((await run("/api/gateway/env")).text).groups.flatMap((g: any) => g.items);
+  const clef = items.find((i: any) => i.name === "CLEF_AUTO_REVIEW");
+  assert.equal(clef.kind, "switch");
+  assert.equal(clef.defaultOn, true);
+  assert.equal(clef.common, true);
+  assert.equal(clef.value, "true");
+  assert.equal(items.find((i: any) => i.name === "ENABLE_DREAM").defaultOn, true);
+  assert.equal(items.find((i: any) => i.name === "CHAT_MODEL").kind, undefined);
 });
 
 test("read-space configuration is backwards compatible, bounded, explicit and round-trips via admin", async () => {
@@ -1041,4 +1175,407 @@ test("keeping a candidate back to pending does not wipe its target memory link",
   });
   assert.equal(cleared?.target_memory_id, null);
   assert.equal(cleared?.decision_note, "judge: 说不准，留给人工");
+});
+
+test("the settings page can see how many memories each space holds", async () => {
+  const add = sqlite.prepare(`INSERT INTO memories (id, namespace, type, content, status, importance, confidence, created_at, updated_at)
+    VALUES (?, ?, 'fact', ?, ?, 1, 1, '2026-09-06', '2026-09-06')`);
+  add.run("d1", "default", "咲咲住在武汉", "active");
+  add.run("d2", "default", "咲咲喜欢越南咖啡", "active");
+  add.run("d3", "default", "旧的住址", "archived");
+  add.run("p1", "partner", "partner fact", "active");
+  const { response, text } = await run("/api/gateway/spaces");
+  assert.equal(response.status, 200);
+  assert.deepEqual(JSON.parse(text).spaces, [{ namespace: "default", memories: 2 }, { namespace: "partner", memories: 1 }]);
+  assert.equal((await worker.fetch(request("/api/gateway/spaces", undefined, { authorization: "Bearer im-key" }), env, ctx)).status, 401);
+});
+
+test("explicit conversation ids and retry hashes stay namespace-local", async () => {
+  const first = await getOrCreateConversation(db, { namespace: "space-a", id: "shared-client-id" });
+  const second = await getOrCreateConversation(db, { namespace: "space-b", id: "shared-client-id" });
+  assert.equal(first.namespace, "space-a");
+  assert.equal(second.namespace, "space-b");
+  assert.notEqual(second.id, first.id);
+  assert.equal((await getOrCreateConversation(db, { namespace: "space-b", id: "shared-client-id" })).id, second.id);
+
+  const save = (conversationId: string, namespace: string) => saveUserMessages(db, {
+    conversationId,
+    namespace,
+    source: "test",
+    messages: [{ role: "user", content: "same words" }],
+    requestModel: "test",
+    upstreamModel: "test",
+    upstreamProvider: "test",
+    stream: false
+  });
+  const [firstMessage] = await save(first.id, first.namespace);
+  const [secondMessage] = await save(second.id, second.namespace);
+  assert.notEqual(firstMessage, secondMessage);
+  const rows = sqlite.prepare("SELECT namespace, conversation_id FROM messages WHERE id IN (?, ?)").all(firstMessage, secondMessage) as any[];
+  assert.deepEqual(rows.map((row) => [row.namespace, row.conversation_id]).sort(), [["space-a", first.id], ["space-b", second.id]]);
+});
+
+// ---- model list: what /v1/models shows, never what can be called ----
+async function admin(method: string, body?: any, headers: any = {}, path = "/api/gateway/config") {
+  const response = await worker.fetch(request(path, body, headers, method), env, ctx);
+  const text = await response.text();
+  return { response, json: text ? JSON.parse(text) : null };
+}
+const LISTED = ["openai/gpt-5", "openrouter/openai/gpt-6.1-sol:floor", "custom-mine/tiny", "dynamic/router-1", "chatgpt/gpt-5"];
+
+test("a saved model list is the whole /v1/models answer: owner's order, hand-typed names kept, upstream never asked", async () => {
+  setConfig({ ...config(), modelList: LISTED });
+  const models = await run("/v1/models");
+  assert.equal(models.response.status, 200);
+  const body = JSON.parse(models.text);
+  assert.equal(body.object, "list");
+  assert.deepEqual(body.data.map((m: any) => m.id), LISTED);
+  assert.deepEqual(body.data.map((m: any) => m.owned_by), ["openai", "openrouter", "custom-mine", "dynamic", "chatgpt"]);
+  // Which of them get memory under this identity (its main models are "partner", "listed-model" and "*opus*").
+  assert.deepEqual(body.data.map((m: any) => m.aelios.main), [false, false, false, false, false]);
+  assert.ok(body.data.every((m: any) => m.object === "model"));
+  assert.equal(models.response.headers.get("x-aelios-models"), "list");
+  assert.match(String(models.response.headers.get("cache-control")), /no-store/);
+  assert.equal(calls.length, 0, "the thousand-model catalog is not fetched when a list decides the answer");
+  // Without CF credentials the list still answers: it does not depend on the upstream.
+  delete env.CLOUDFLARE_API_TOKEN;
+  assert.deepEqual(JSON.parse((await run("/v1/models")).text).data.map((m: any) => m.id), LISTED);
+});
+
+test("an empty or missing model list leaves /v1/models exactly as it was", async () => {
+  for (const modelList of [undefined, []]) {
+    setConfig({ ...config(), ...(modelList ? { modelList } : {}) });
+    const models = await run("/v1/models");
+    assert.equal(models.response.headers.get("x-aelios-models"), "upstream");
+    assert.deepEqual(JSON.parse(models.text).data.map((m: any) => m.id), ["anthropic/claude-opus-4-5"]);
+  }
+});
+
+test("models outside the list still work: the list is display only", async () => {
+  setConfig({ ...config(), modelList: ["openai/gpt-5"] });
+  for (const model of ["anthropic/claude-opus-4-5", "openrouter/openai/gpt-6.1-sol:floor", "custom-other/unlisted"]) {
+    calls.length = 0;
+    const reply = await run("/v1/chat/completions", { model, messages: [{ role: "user", content: "Hi" }] });
+    assert.equal(reply.response.status, 200, model);
+    assert.equal(calls[0].url, "https://upstream.test/ai/v1/chat/completions");
+    assert.equal(calls[0].query.model, model);
+  }
+});
+
+test("model list validation: trimmed, de-duplicated, order kept, empty means none", () => {
+  const base = { version: 3, identities: [] };
+  assert.deepEqual(validateConfig({ ...base, modelList: [" a/b ", "c", "a/b"] }).modelList, ["a/b", "c"]);
+  assert.equal("modelList" in validateConfig({ ...base, modelList: [] }), false);
+  assert.equal("modelList" in validateConfig({ ...base, modelList: null }), false);
+  assert.equal("modelList" in validateConfig(base), false);
+  for (const bad of ["a/b", [""], [" "], ["has space"], [1], ["x".repeat(201)], Array.from({ length: 301 }, (_, i) => `m/${i}`)]) {
+    assert.throws(() => validateConfig({ ...base, modelList: bad as any }), /modelList/, JSON.stringify(bad).slice(0, 40));
+  }
+  assert.equal(validateConfig({ ...base, modelList: Array.from({ length: 300 }, (_, i) => `m/${i}`) }).modelList?.length, 300);
+});
+
+test("the list is saved with PATCH by the owner only, and other PATCHes leave it alone", async () => {
+  assert.equal((await admin("PATCH", { modelList: ["a/b"] }, { authorization: "Bearer im-key" })).response.status, 401);
+  const saved = await admin("PATCH", { modelList: [" openai/gpt-5 ", "custom-mine/tiny", "openai/gpt-5"] });
+  assert.equal(saved.response.status, 200);
+  assert.deepEqual(saved.json.modelList, ["openai/gpt-5", "custom-mine/tiny"]);
+  assert.deepEqual((await admin("GET")).json.modelList, ["openai/gpt-5", "custom-mine/tiny"]);
+  // The identities save and the settings saves in /admin never carry the list; they must not wipe it.
+  await admin("PATCH", { identities: [identity()] });
+  await admin("PATCH", { settings: { VISION_MODEL: "x/vision" } });
+  assert.deepEqual((await admin("GET")).json.modelList, ["openai/gpt-5", "custom-mine/tiny"]);
+  // And it is what the clients see right away.
+  assert.deepEqual(JSON.parse((await run("/v1/models")).text).data.map((m: any) => m.id), ["openai/gpt-5", "custom-mine/tiny"]);
+  const bad = await admin("PATCH", { modelList: ["has space"] });
+  assert.equal(bad.response.status, 400);
+  assert.deepEqual((await admin("GET")).json.modelList, ["openai/gpt-5", "custom-mine/tiny"], "a refused save changes nothing");
+  assert.deepEqual((await admin("PATCH", { modelList: [] })).json.modelList, []);
+  assert.equal("modelList" in (await admin("GET")).json, false);
+  assert.equal(JSON.parse((await run("/v1/models")).text).data[0].id, "anthropic/claude-opus-4-5", "cleared: the whole upstream catalog again");
+});
+
+test("the picker catalog: owner only, every upstream id once and sorted, the saved list beside it, even while a list is saved", async () => {
+  setConfig({ ...config(), modelList: ["custom-mine/tiny"] });
+  assert.equal((await admin("GET", undefined, { authorization: "Bearer im-key" }, "/api/gateway/models")).response.status, 401);
+  const mock = globalThis.fetch;
+  globalThis.fetch = async (url: any) => {
+    calls.push({ url: String(url) });
+    return Response.json({ object: "list", data: [{ id: "openai/gpt-5" }, { id: "anthropic/claude-opus-4-5" }, { id: "openai/gpt-5" }, { nope: true }, null, { id: 7 }] });
+  };
+  try {
+    const picker = await admin("GET", undefined, {}, "/api/gateway/models");
+    assert.equal(picker.response.status, 200);
+    assert.deepEqual(picker.json.models, ["anthropic/claude-opus-4-5", "openai/gpt-5"]);
+    assert.deepEqual(picker.json.list, ["custom-mine/tiny"]);
+    assert.deepEqual(picker.json.chatgpt, []);
+    assert.equal(picker.json.source, "upstream");
+    assert.equal(calls.at(-1).url, "https://upstream.test/ai/v1/models");
+    globalThis.fetch = async () => new Response("nope", { status: 502 });
+    const down = await admin("GET", undefined, {}, "/api/gateway/models");
+    assert.equal(down.response.status, 200);
+    assert.deepEqual(down.json.models, []);
+    assert.equal(down.json.source, "unavailable");
+    assert.equal(down.json.reason, "upstream-502");
+    assert.deepEqual(down.json.list, ["custom-mine/tiny"], "the saved list is still there to edit");
+    globalThis.fetch = async () => new Response("<html>", { status: 200 });
+    assert.equal((await admin("GET", undefined, {}, "/api/gateway/models")).json.reason, "unexpected-catalog");
+  } finally { globalThis.fetch = mock; }
+});
+
+// ---- model connectivity test: one tiny real request, sent the way a client's is, recorded nowhere ----
+const testModel = (model: any, headers: any = {}) => admin("POST", { model }, headers, "/api/gateway/models/test");
+const completion = (content = "OK") => Response.json({ model: "actual", choices: [{ index: 0, message: { content }, finish_reason: "stop" }] });
+
+test("model test: owner only, and the model must be a name", async () => {
+  assert.equal((await testModel("a/b", { authorization: "Bearer im-key" })).response.status, 401);
+  for (const bad of [undefined, "", "has space", "x".repeat(201), 7]) {
+    assert.equal((await testModel(bad)).response.status, 400, JSON.stringify(bad)?.slice(0, 20));
+  }
+  assert.equal(calls.length, 0, "nothing was sent upstream for a refused input");
+});
+
+test("model test: a model that answers passes, over the same chat route a client uses, and nothing is recorded", async () => {
+  const mock = globalThis.fetch;
+  globalThis.fetch = async (url: any, init: any) => { calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init?.headers)), query: JSON.parse(init.body) }); return completion(" OK \n"); };
+  try {
+    const result = await testModel("openrouter/openai/gpt-6.1-sol:floor");
+    assert.equal(result.response.status, 200);
+    assert.equal(result.json.ok, true);
+    assert.equal(result.json.status, 200);
+    assert.equal(result.json.reply, "OK");
+    assert.equal(typeof result.json.latency_ms, "number");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "https://upstream.test/ai/v1/chat/completions");
+    assert.equal(calls[0].headers.authorization, "Bearer cf-token");
+    assert.equal(calls[0].query.model, "openrouter/openai/gpt-6.1-sol:floor");
+    assert.equal(calls[0].query.stream, false);
+    assert.equal(calls[0].query.max_tokens, 32);
+    assert.equal(calls[0].query.messages.length, 1, "no memory is added to a connectivity test");
+    await Promise.all(pending);
+    assert.equal(queue.length, 0);
+    assert.equal(count("gateway_exchanges"), 0);
+    assert.equal(count("messages"), 0);
+  } finally { globalThis.fetch = mock; }
+});
+
+test("model test: a refusal comes back with the upstream's own words; HTML is cut down; a 200 that is not a completion fails", async () => {
+  const mock = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => Response.json({ error: { message: "The model `nope/x` does not exist." } }, { status: 404 });
+    const missing = await testModel("nope/x");
+    assert.deepEqual([missing.json.ok, missing.json.status, missing.json.error], [false, 404, "The model `nope/x` does not exist."]);
+    globalThis.fetch = async () => new Response(`<html>${"x".repeat(2000)}</html>`, { status: 502 });
+    const html = await testModel("a/b");
+    assert.equal(html.json.ok, false);
+    assert.equal(html.json.status, 502);
+    assert.ok(html.json.error.length <= 300);
+    globalThis.fetch = async () => Response.json({ hello: "world" });
+    assert.match((await testModel("a/b")).json.error, /not with a chat completion/);
+    globalThis.fetch = async () => new Response("<html>login</html>", { status: 200 });
+    assert.match((await testModel("a/b")).json.error, /not with JSON/);
+    globalThis.fetch = async () => { throw new Error("connection reset"); };
+    const reset = await testModel("a/b");
+    assert.deepEqual([reset.json.ok, reset.json.status, reset.json.error], [false, 0, "connection reset"]);
+  } finally { globalThis.fetch = mock; }
+  delete env.CLOUDFLARE_API_TOKEN;
+  const unset = await testModel("a/b");
+  assert.equal(unset.json.ok, false);
+  assert.match(unset.json.error, /CLOUDFLARE_API_TOKEN/);
+});
+
+test("model test: a reasoning model that wants max_completion_tokens is asked once more with it", async () => {
+  const mock = globalThis.fetch;
+  const sent: any[] = [];
+  globalThis.fetch = async (_url: any, init: any) => {
+    const body = JSON.parse(init.body); sent.push(body);
+    return "max_tokens" in body
+      ? Response.json({ error: { message: "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead." } }, { status: 400 })
+      : completion();
+  };
+  try {
+    const result = await testModel("openai/gpt-5");
+    assert.equal(result.json.ok, true);
+    assert.equal(sent.length, 2);
+    assert.equal(sent[1].max_completion_tokens, 32);
+    assert.equal("max_tokens" in sent[1], false);
+    // A 400 about anything else is the answer, not a reason to retry.
+    sent.length = 0;
+    globalThis.fetch = async (_url: any, init: any) => { sent.push(1); return Response.json({ error: { message: "bad key" } }, { status: 400 }); };
+    const other = await testModel("openai/gpt-5");
+    assert.deepEqual([other.json.ok, other.json.error, sent.length], [false, "bad key", 1]);
+  } finally { globalThis.fetch = mock; }
+});
+
+test("the model list marks which models get memory under the asking identity; other clients can ignore it", async () => {
+  const other = { ...identity(), slug: "other", namespace: "partner-b", keys: ["IM_API_KEY"], models: ["chatgpt/*", "*sol*"] };
+  setConfig({ ...config([identity(), other]), modelList: ["anthropic/claude-opus-4-5", "partner", "chatgpt/gpt-5", "openrouter/openai/gpt-6.1-sol:floor", "custom-mine/tiny"] });
+  const mark = async (path: string, headers?: any) =>
+    Object.fromEntries(JSON.parse((await run(path, undefined, headers)).text).data.map((m: any) => [m.id, m.aelios.main]));
+  // "partner" and "*opus*" are main models for the first identity: the pattern matches the full name or the part after the last slash.
+  assert.deepEqual(await mark("/v1/models"), {
+    "anthropic/claude-opus-4-5": true, partner: true, "chatgpt/gpt-5": false, "openrouter/openai/gpt-6.1-sol:floor": false, "custom-mine/tiny": false });
+  // The same list under the other identity, reached by its path with the key it allows.
+  assert.deepEqual(await mark("/other/v1/models", { authorization: "Bearer im-key" }), {
+    "anthropic/claude-opus-4-5": false, partner: false, "chatgpt/gpt-5": true, "openrouter/openai/gpt-6.1-sol:floor": true, "custom-mine/tiny": false });
+});
+
+test("codingClient knows coding agents by header or by shell plus edit tools", () => {
+  const h = (init: Record<string, string>) => new Headers(init);
+  assert.equal(codingClient(h({ "user-agent": "claude-cli/2.1.0 (external, cli)" }), {}), "client:claude-cli");
+  assert.equal(codingClient(h({ originator: "codex_cli_rs", "user-agent": "codex_cli_rs/0.50.0" }), {}), "client:codex");
+  assert.equal(codingClient(h({ "x-title": "Cline", "http-referer": "https://cline.bot" }), {}), "client:cline");
+  assert.equal(codingClient(h({ "x-title": "Roo Code" }), {}), "client:roo code");
+  assert.equal(codingClient(h({ "user-agent": "opencode/0.15.0" }), {}), "client:opencode");
+  // Messages, Chat Completions and Responses tool shapes, including Anthropic's versioned server tools.
+  assert.equal(codingClient(h({}), { tools: [{ name: "Bash" }, { name: "Read" }, { name: "Edit" }] }), "tools:bash+edit");
+  assert.equal(codingClient(h({}), { tools: [{ type: "bash_20250124", name: "bash" }, { type: "text_editor_20250728", name: "str_replace_based_edit_tool" }] }), "tools:bash+strreplacebasededittool");
+  assert.equal(codingClient(h({}), { tools: [{ type: "function", function: { name: "execute_command" } }, { type: "function", function: { name: "replace_in_file" } }] }), "tools:executecommand+replaceinfile");
+  assert.equal(codingClient(h({}), { tools: [{ type: "local_shell" }, { type: "custom", name: "apply_patch" }] }), "tools:localshell+applypatch");
+  // A companion app: chat UAs, memory and web tools, or only one of the two kinds.
+  assert.equal(codingClient(h({ "user-agent": "Mozilla/5.0 Chatbox/1.15" }), { tools: [{ name: "web_search" }, { name: "memory_recall" }, { name: "write_diary" }] }), null);
+  assert.equal(codingClient(h({ "user-agent": "Anthropic/JS 0.60.0" }), { tools: [{ name: "bash" }, { name: "read" }] }), null);
+  assert.equal(codingClient(h({}), {}), null);
+});
+
+test("coding speech keeps words, turns code blocks into [code] and drops code steps", () => {
+  assert.equal(stripCodeBlocks("改成这样：\n```ts\nconst a = 1;\n```\n好了"), "改成这样：\n[code]\n好了");
+  assert.equal(stripCodeBlocks("先看：\n~~~py\nprint(1)\n没关上"), "先看：\n[code]");
+  assert.equal(stripCodeBlocks("行内 `code` 不动"), "行内 `code` 不动");
+  assert.equal(stripCodeBlocks("```\nonly code\n```"), "");
+  const said = (content: unknown[]) => {
+    const out = new OutputCollector("messages", true);
+    out.json({ content, stop_reason: "tool_use" });
+    out.finish();
+    return codingSpeech(out).text;
+  };
+  assert.equal(said([{ type: "text", text: "Let me read it." }, { type: "tool_use", name: "Read", input: { file_path: "a.ts" } }]), "");
+  assert.equal(said([{ type: "text", text: "我去发" }, { type: "tool_use", name: "weixin_send", input: { text: "晚安" } },
+    { type: "tool_use", name: "exec", input: { command: "ls" } }]), "weixin_send {\"text\":\"晚安\"}");
+  assert.equal(said([{ type: "text", text: "改好了。\n```\nx\n```" }]), "改好了。\n[code]");
+  // A speech tool's name is speech words and where they go, nothing else; MCP server names are not judged.
+  for (const name of ["weixin_send", "send_message", "sendMessage", "reply", "tts_speak", "send_sticker", "mcp__weixin__send_message", "send_message_v2"]) assert.ok(isSpeechTool(name), name);
+  for (const name of ["sendKeys", "commit_message", "Read", "mcp__github__create_pull_request", "log_message", "send_file", "send_patch", "AskUserQuestion"]) assert.ok(!isSpeechTool(name), name);
+});
+
+test("coding agents are recorded as conversation only, unless the assistant turns the filter off", async () => {
+  const mock = globalThis.fetch;
+  let reply: any = { content: [{ type: "text", text: "我先看看。" }, { type: "tool_use", id: "r", name: "Read", input: { file_path: "/src/a.ts" } }], stop_reason: "tool_use" };
+  globalThis.fetch = async (url: any, init: any) => {
+    calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init?.headers)), query: JSON.parse(init?.body as string) });
+    return Response.json({ model: "claude-test", ...reply });
+  };
+  const claudeCode = { "user-agent": "claude-cli/2.1.0 (external, cli)" };
+  const ask = { role: "user", content: "老公帮我把按钮改蓝\n```css\n.btn { color: red }\n```" };
+  const step = { role: "assistant", content: reply.content };
+  const result = { role: "user", content: [{ type: "tool_result", tool_use_id: "r", content: ".btn { color: red }" }] };
+  try {
+    // Her turn: recorded without the code, and the reply's file read is not.
+    let out = await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask] }, claudeCode);
+    assert.equal(out.response.headers.get("x-aelios-coding"), "client:claude-cli");
+    assert.equal((sqlite.prepare("SELECT content FROM messages WHERE role = 'user'").get() as any).content, "老公帮我把按钮改蓝\n[code]");
+    assert.equal(queue.length, 1); assert.equal(queue[0].assistantText, "");
+    // A step that only edits code: nothing dispatched at all.
+    reply = { content: [{ type: "tool_use", id: "e", name: "Edit", input: { old_string: "red", new_string: "blue" } }], stop_reason: "tool_use" };
+    out = await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask, step, result] }, claudeCode);
+    assert.equal(out.response.status, 200);
+    assert.equal(queue.length, 1);
+    // The closing reply is conversation and is kept, code and all turned into [code].
+    reply = { content: [{ type: "text", text: "改好了，现在是蓝色。\n```css\n.btn { color: blue }\n```" }], stop_reason: "end_turn" };
+    await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask, step, result] }, claudeCode);
+    assert.equal(queue.length, 2); assert.equal(queue[1].assistantText, "改好了，现在是蓝色。\n[code]");
+    // Filter off: the old behaviour, everything recorded.
+    setConfig(config([{ ...identity(), codingFilter: false } as ReturnType<typeof identity>]));
+    reply = { content: [{ type: "tool_use", id: "e", name: "Edit", input: { old_string: "red", new_string: "blue" } }], stop_reason: "tool_use" };
+    out = await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask, step, result] }, claudeCode);
+    assert.equal(out.response.headers.get("x-aelios-coding"), null);
+    assert.equal(queue.length, 3); assert.match(queue[2].assistantText, /Edit/);
+  } finally { globalThis.fetch = mock; }
+  assert.throws(() => validateConfig({ ...config(), identities: [{ ...identity(), codingFilter: "yes" }] }), /codingFilter/);
+});
+
+test("coding filter: code tool arguments neither crowd out nor smuggle in what is kept", async () => {
+  const mock = globalThis.fetch;
+  let reply: any;
+  globalThis.fetch = async (url: any, init: any) => {
+    calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init?.headers)), query: JSON.parse(init?.body as string) });
+    return typeof reply === "function" ? reply() : Response.json({ model: "claude-test", ...reply });
+  };
+  const claudeCode = { "user-agent": "claude-cli/2.1.0 (external, cli)" };
+  const ask = { role: "user", content: "帮我改一下" };
+  const loop = (n: number) => [ask, { role: "assistant", content: [{ type: "tool_use", id: `t${n}`, name: "Read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: `t${n}`, content: "ok" }] }];
+  const step = async (n: number) => { const before = queue.length;
+    await run("/v1/messages", { model: "partner", max_tokens: 64, messages: loop(n) }, claudeCode);
+    return queue.length > before ? queue.at(-1) : null; };
+  try {
+    // A huge edit next to a message: the message is kept whole, not lost to the 8,000-character cap.
+    reply = { content: [{ type: "tool_use", id: "e", name: "Edit", input: { new_string: "x".repeat(9000) } },
+      { type: "tool_use", id: "w", name: "weixin_send", input: { text: "晚安" } }], stop_reason: "tool_use" };
+    let kept = await step(1);
+    assert.ok(kept); assert.equal(kept.completion, "complete"); assert.match(kept.assistantText, /晚安/); assert.doesNotMatch(kept.assistantText, /xxxx/);
+    // A huge kept call is still held to the cap.
+    reply = { content: [{ type: "tool_use", id: "w", name: "weixin_send", input: { text: "长".repeat(9000) } },
+      { type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    kept = await step(2);
+    assert.ok(kept); assert.ok(kept.assistantText.length <= 8000); assert.equal(kept.completion, "truncated");
+    // Tool names nobody listed are not speech either.
+    reply = { content: [{ type: "text", text: "我开个 PR。" }, { type: "tool_use", id: "g", name: "mcp__github__create_pull_request", input: { body: "diff --git a/x b/x" } }], stop_reason: "tool_use" };
+    assert.equal(await step(3), null);
+    // A failed step is still recorded as failed, for diagnosis, and its retry closes it.
+    const status = () => (sqlite.prepare("SELECT completion_status AS s FROM gateway_exchanges WHERE profile = 'partner' ORDER BY created_at DESC LIMIT 1").get() as any)?.s;
+    reply = () => Response.json({ type: "error", error: { type: "api_error", message: "boom" } }, { status: 500 });
+    assert.equal(await step(4), null);
+    assert.equal(status(), "failed");
+    reply = { content: [{ type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    assert.equal(await step(4), null);
+    assert.equal(status(), "complete"); assert.equal(count("gateway_exchanges"), 1);
+    // A long code block does not push the words after it out of the cap.
+    reply = { content: [{ type: "text", text: `改好了：\n\`\`\`ts\n${"x".repeat(9000)}\n\`\`\`\nDone` }], stop_reason: "end_turn" };
+    kept = await step(5);
+    assert.ok(kept); assert.equal(kept.completion, "complete"); assert.equal(kept.assistantText, "改好了：\n[code]\nDone");
+    // Speech tools are names made only of speech words, and code inside what they say becomes [code].
+    reply = { content: [{ type: "tool_use", id: "p", name: "send_patch", input: { patch: "diff --git a/x b/x" } },
+      { type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    assert.equal(await step(6), null);
+    reply = { content: [{ type: "tool_use", id: "m", name: "mcp__weixin__send_message", input: { text: "看这个\n```js\nconst a = 1\n```\n好吧" } },
+      { type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    kept = await step(7);
+    assert.ok(kept); assert.match(kept.assistantText, /\[code\]/); assert.doesNotMatch(kept.assistantText, /const a/);
+  } finally { globalThis.fetch = mock; }
+});
+
+test("coding filter: streamed code is dropped as it arrives, and streamed tool arguments are bounded", () => {
+  const sse = (events: unknown[]) => new TextEncoder().encode(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(""));
+  const text = (t: string) => ({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: t } });
+  const out = new OutputCollector("messages", true);
+  out.chunk(sse([{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }, text("看：\n`"), text("``t"), text("s\n")]));
+  for (let i = 0; i < 20; i++) out.chunk(sse([text("y".repeat(1000))]));
+  out.chunk(sse([text("\n``"), text("`\n好了"), { type: "message_delta", delta: { stop_reason: "end_turn" } }, { type: "message_stop" }]));
+  out.finish();
+  assert.deepEqual(codingSpeech(out), { text: "看：\n[code]\n好了", truncated: false });
+  // A huge streamed edit is not held in memory, and does not mark a coding step cut off.
+  const big = new OutputCollector("messages", true);
+  big.chunk(sse([{ type: "content_block_start", index: 1, content_block: { type: "tool_use", name: "Write" } }]));
+  for (let i = 0; i < 100; i++) big.chunk(sse([{ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "z".repeat(1000) } }]));
+  assert.ok((big as any).pending.get(1).json.length <= 64000);
+  big.chunk(sse([{ type: "content_block_stop", index: 1 }, { type: "message_stop" }]));
+  big.finish();
+  assert.deepEqual(codingSpeech(big), { text: "", truncated: false });
+  // Outside coding mode the same call is kept up to the cap and marked cut off.
+  const plain = new OutputCollector("messages");
+  plain.chunk(sse([{ type: "content_block_start", index: 1, content_block: { type: "tool_use", name: "Write" } }]));
+  for (let i = 0; i < 100; i++) plain.chunk(sse([{ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "z".repeat(1000) } }]));
+  plain.chunk(sse([{ type: "content_block_stop", index: 1 }, { type: "message_stop" }]));
+  plain.finish();
+  assert.ok(plain.truncated); assert.ok(plain.text.length <= 8000);
+});
+
+test("coding filter: a longer closing fence ends the block, and earlier code stays out of recall", async () => {
+  assert.equal(stripCodeBlocks("看：\n```\ncode\n````\n后面的话"), "看：\n[code]\n后面的话");
+  assert.equal(stripCodeBlocks("看：\n````\n```\n还在块里\n````\n后面"), "看：\n[code]\n后面");
+  precious("partner-a", "量子猫咪是暗号");
+  await run("/v1/chat/completions", { model: "partner", messages: [
+    { role: "user", content: "看这个\n```\n量子猫咪\n```" }, { role: "assistant", content: "嗯" }, { role: "user", content: "好了吗" }] },
+  { "user-agent": "claude-cli/2.1.0 (external, cli)" });
+  assert.doesNotMatch(JSON.stringify(calls.at(-1).query.messages.at(-1)), /量子猫咪是暗号/);
 });

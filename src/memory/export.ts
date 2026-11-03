@@ -3,6 +3,12 @@ import { fetchMemoryLifecycleRows } from "../db/v2";
 import type { Env, MemoryApiRecord, MemoryRecord } from "../types";
 import { createEmbedding } from "./embedding";
 import { toMemoryApiRecord } from "./search";
+import {
+  type ExportMemoryRow,
+  type ExportPreciousRow,
+  formatMemoriesJsonl,
+  formatMemoriesMarkdown
+} from "./transfer/memoryText";
 
 export interface MemoryExportInput {
   namespace: string;
@@ -286,5 +292,126 @@ export async function exportMemories(env: Env, input: MemoryExportInput): Promis
         ...(vectorize.error ? { error: vectorize.error } : {})
       }
     }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 导出成 md / jsonl：从 D1 读 (D1 是本体)，给人看、能直接改、能再导回去。
+// ---------------------------------------------------------------------------
+
+export type MemoryDocumentFormat = "md" | "jsonl";
+
+interface ExportMemoryDbRow {
+  id: string;
+  type: string;
+  content: string;
+  fact_key: string | null;
+  tags: string | null;
+  importance: number;
+  confidence: number;
+  pinned: number;
+  source: string | null;
+  source_message_ids: string | null;
+  created_at: string;
+  updated_at: string;
+  valid_as_of: string | null;
+  authored_by: string | null;
+  response_tendency: string | null;
+}
+
+function parseStringList(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function loadExportRows(
+  db: D1Database,
+  namespace: string
+): Promise<{ memories: ExportMemoryRow[]; precious: ExportPreciousRow[] }> {
+  const memories: ExportMemoryRow[] = [];
+  for (let offset = 0; ; offset += EXPORT_PAGE_SIZE) {
+    const page = await db
+      .prepare(
+        `SELECT m.id, m.type, m.content, COALESCE(m.fact_key, lc.fact_key) AS fact_key, m.tags, m.importance, m.confidence,
+           m.pinned, m.source, m.source_message_ids, m.created_at, m.updated_at, lc.valid_as_of,
+           m.authored_by, m.response_tendency
+         FROM memories m
+         LEFT JOIN memory_lifecycle lc ON lc.memory_id = m.id
+         WHERE m.namespace = ? AND m.status = 'active'
+           AND (m.version_status IS NULL OR m.version_status != 'superseded')
+         ORDER BY m.created_at ASC, m.id ASC
+         LIMIT ? OFFSET ?`
+      )
+      .bind(namespace, EXPORT_PAGE_SIZE, offset)
+      .all<ExportMemoryDbRow>();
+    const rows = page.results ?? [];
+    for (const row of rows) {
+      memories.push({
+        id: row.id,
+        type: row.type,
+        content: row.content,
+        fact_key: row.fact_key,
+        tags: parseStringList(row.tags),
+        importance: row.importance,
+        confidence: row.confidence,
+        pinned: Boolean(row.pinned),
+        source: row.source,
+        source_message_ids: parseStringList(row.source_message_ids),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        valid_as_of: row.valid_as_of,
+        authored_by: row.authored_by,
+        response_tendency: row.response_tendency
+      });
+    }
+    if (rows.length < EXPORT_PAGE_SIZE) break;
+  }
+
+  const precious = await db
+    .prepare(
+      `SELECT id, content, source, created_at FROM precious
+       WHERE namespace = ? AND pinned = 1
+       ORDER BY created_at ASC, id ASC`
+    )
+    .bind(namespace)
+    .all<ExportPreciousRow>();
+  return { memories, precious: precious.results ?? [] };
+}
+
+export async function exportMemoryDocument(
+  env: Env,
+  input: { namespace: string; format: MemoryDocumentFormat; title?: string | null; timeZone: string }
+): Promise<{ body: string; contentType: string; filename: string; memories: number; precious: number }> {
+  const { memories, precious } = await loadExportRows(env.DB, input.namespace);
+  const exportedAt = new Date().toISOString();
+  const day = exportedAt.slice(0, 10);
+  const safeNamespace = input.namespace.replace(/[^A-Za-z0-9_-]+/g, "_") || "space";
+  if (input.format === "jsonl") {
+    return {
+      body: formatMemoriesJsonl({ namespace: input.namespace, exportedAt, memories, precious }),
+      contentType: "application/x-ndjson; charset=utf-8",
+      filename: `aelios-${safeNamespace}-${day}.jsonl`,
+      memories: memories.length,
+      precious: precious.length
+    };
+  }
+  return {
+    body: formatMemoriesMarkdown({
+      namespace: input.namespace,
+      title: input.title,
+      exportedAt,
+      timeZone: input.timeZone,
+      memories,
+      precious
+    }),
+    contentType: "text/markdown; charset=utf-8",
+    filename: `aelios-${safeNamespace}-${day}.md`,
+    memories: memories.length,
+    precious: precious.length
   };
 }

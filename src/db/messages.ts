@@ -1,9 +1,10 @@
-import { upsertMessageFts } from "../memory/fts";
+import { insertMessageFts } from "../memory/fts";
 import type { MessageRecord, OpenAIChatMessage, TokenUsage } from "../types";
 import { sha256Hex } from "../utils/hash";
 import { newId } from "../utils/ids";
 import { nowIso } from "../utils/time";
 import { cleanMessageText } from "../utils/sanitize";
+import { getImportedMessagesByIds, IMPORTED_MESSAGE_PREFIX } from "./v2/imports";
 
 export const MESSAGE_ORDER_SQL =
   "created_at ASC, seq ASC, CASE role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 ELSE 2 END ASC, id ASC";
@@ -24,7 +25,7 @@ function contentToText(content: OpenAIChatMessage["content"]): string {
 }
 
 // Stable-hash normalization: trim + collapse whitespace so retrying the same
-// (conversationId, role, content, bucket) yields an identical hash. The DB id
+// (namespace, conversationId, role, content, bucket) yields an identical hash. The DB id
 // stays random; only the hash drops it — that is what makes the hash idempotent.
 function normalizeContent(content: string): string {
   return content.replace(/\s+/g, " ").trim();
@@ -56,7 +57,7 @@ export async function saveUserMessages(
     // straddles a bucket boundary may insert a duplicate — accepted, rare, and
     // strictly better than dropping real messages.
     const bucket = Math.floor(Date.now() / 600_000);
-    const hash = await sha256Hex(`${input.conversationId}:${message.role}:${normalizeContent(content)}:${bucket}`);
+    const hash = await sha256Hex(`${input.namespace}:${input.conversationId}:${message.role}:${normalizeContent(content)}:${bucket}`);
 
     const result = await db
       .prepare(
@@ -83,6 +84,7 @@ export async function saveUserMessages(
       .run();
 
     // Duplicate hash (client retry): return the existing row id so callers still get a valid message id.
+    // That row was indexed when it was first saved, so only a fresh row needs an FTS entry.
     if ((result.meta.changes ?? 0) === 0) {
       const existing = await db
         .prepare("SELECT id FROM messages WHERE client_message_hash = ? LIMIT 1")
@@ -91,8 +93,8 @@ export async function saveUserMessages(
       ids.push(existing?.id ?? id);
     } else {
       ids.push(id);
+      await insertMessageFts(db, { namespace: input.namespace, messageId: id, content });
     }
-    await upsertMessageFts(db, { namespace: input.namespace, messageId: ids[ids.length - 1], content });
   }
 
   return ids;
@@ -152,7 +154,7 @@ export async function saveAssistantMessage(
     )
     .run();
 
-  await upsertMessageFts(db, { namespace: input.namespace, messageId: id, content: input.content });
+  await insertMessageFts(db, { namespace: input.namespace, messageId: id, content: input.content });
   return id;
 }
 
@@ -197,8 +199,16 @@ export async function getMessagesByIds(
     )
     .bind(input.namespace, ...input.ids)
     .all<MessageRecord>();
+  const rows = result.results ?? [];
 
-  return withOctoberSpeakers(db, input.namespace, result.results ?? []);
+  // 导入的旧聊天不在 messages 里 (那里 7 天就删)，候选和记忆挂的是 imsg_ 开头的 id，到 imported_messages 找。
+  // 看出处、clef 审、助手用 MCP 看候选都走这里，所以导入的原话处处都查得到。
+  const found = new Set(rows.map((row) => row.id));
+  const importedIds = input.ids.filter((id) => !found.has(id) && id.startsWith(IMPORTED_MESSAGE_PREFIX));
+  const all = importedIds.length === 0
+    ? rows
+    : [...rows, ...(await getImportedMessagesByIds(db, { namespace: input.namespace, ids: importedIds }))];
+  return withOctoberSpeakers(db, input.namespace, all);
 }
 
 export async function countMessagesAfterTimestamp(
@@ -296,6 +306,39 @@ export async function listMessagesByNamespaceInRange(
   return withOctoberSpeakers(db, input.namespace, result.results ?? []);
 }
 
+// log_conversation 去重：同一对话里已经存过的 (role, 正文) 不再存第二遍，同一批里重复的也只留一条。
+// 正文按 saveIngestMessages 落库时的同一套清洗比较，空白差异不算不同。
+/**
+ * 删一句原话（后台首页「今天的对话」的删除键）：报错、乱码、突然拒答这种不想留的。
+ * 全文索引一起删，夜里整理、写日记和召回原话都不会再读到它。
+ */
+export async function deleteMessage(db: D1Database, input: { namespace: string; id: string }): Promise<boolean> {
+  const [deleted] = await db.batch([
+    db.prepare("DELETE FROM messages WHERE namespace = ? AND id = ?").bind(input.namespace, input.id),
+    db.prepare("DELETE FROM message_fts WHERE namespace = ? AND message_id = ?").bind(input.namespace, input.id)
+  ]);
+  return (deleted?.meta?.changes ?? 0) > 0;
+}
+
+export async function filterUnsavedMessages(
+  db: D1Database,
+  input: { namespace: string; conversationId: string; messages: OpenAIChatMessage[] }
+): Promise<OpenAIChatMessage[]> {
+  const stored = await db
+    .prepare("SELECT role, content FROM messages WHERE namespace = ? AND conversation_id = ?")
+    .bind(input.namespace, input.conversationId)
+    .all<{ role: string; content: string }>();
+  const seen = new Set((stored.results ?? []).map((row) => `${row.role}\n${normalizeContent(row.content)}`));
+  const fresh: OpenAIChatMessage[] = [];
+  for (const message of input.messages) {
+    const key = `${message.role}\n${normalizeContent(cleanMessageText(contentToText(message.content)))}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    fresh.push(message);
+  }
+  return fresh;
+}
+
 export async function saveIngestMessages(
   db: D1Database,
   input: {
@@ -333,7 +376,7 @@ export async function saveIngestMessages(
         seq
       )
       .run();
-    await upsertMessageFts(db, { namespace: input.namespace, messageId: id, content });
+    await insertMessageFts(db, { namespace: input.namespace, messageId: id, content });
     seq += 1;
   }
 

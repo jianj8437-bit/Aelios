@@ -436,11 +436,11 @@ function createMockD1() {
             response_tendency: row.response_tendency ?? null
           };
         }
-        if (normalized.includes("SELECT m.id, m.authored_by, m.response_tendency FROM memories m")) {
+        if (normalized.includes("SELECT m.id, m.type, m.authored_by, m.response_tendency FROM memories m")) {
           const [namespace, factKey] = binds;
           const row = findActiveByFactKey(namespace, factKey);
           return row
-            ? { id: row.id, authored_by: row.authored_by ?? null, response_tendency: row.response_tendency ?? null }
+            ? { id: row.id, type: row.type ?? null, authored_by: row.authored_by ?? null, response_tendency: row.response_tendency ?? null }
             : null;
         }
         if (normalized.includes("FROM monthly_log") && normalized.includes("month = ?")) {

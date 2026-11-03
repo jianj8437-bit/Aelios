@@ -1,14 +1,17 @@
 import type { Env } from "../types";
-import { upsertMessageFts } from "../memory/fts";
+import { insertMessageFts } from "../memory/fts";
 import { captureRememberNow } from "../memory/rememberNow";
 import { sha256Hex } from "../utils/hash";
 import { getSseData, splitSseEvents } from "../utils/sseParser";
 import { cleanMessageText } from "../utils/sanitize";
+import { CodeFilter, isSpeechTool, replaceCodeIn } from "./coding";
 import { identityNamespace, object, type Identity, type Protocol } from "./config";
 import { canonical, inputItems, visibleText, type Body, type Turn } from "./protocol";
 
 // Two JSON-escaped text fields plus metadata fit within a Queue message.
 const TEXT_LIMIT = 8000;
+/** A streamed tool call's arguments are held up to this much (8,000 characters even when \u-escaped). */
+const TOOL_ARGS_LIMIT = 64000;
 export interface GatewayExchange {
   type: "gateway_exchange";
   id: string;
@@ -27,12 +30,13 @@ export interface GatewayExchange {
   createdAt: string;
   stream: boolean;
 }
+/** `session` stands in for the x-aelios-session-id header when the caller has it some other way (the hook endpoints). */
 export async function prepareExchange(request: Request, body: Body, identity: Identity,
-  protocol: Protocol, turn: Turn, source: string): Promise<GatewayExchange> {
-  const session = request.headers.get("x-aelios-session-id") || request.headers.get("session_id") ||
+  protocol: Protocol, turn: Turn, source: string, session: string | null = null): Promise<GatewayExchange> {
+  const scopeSession = session || request.headers.get("x-aelios-session-id") || request.headers.get("session_id") ||
     request.headers.get("x-session-id") || body.metadata?.session_id || "unscoped";
   const namespace = identityNamespace(identity);
-  const scope = canonical([namespace, identity.slug, source, session]);
+  const scope = canonical([namespace, identity.slug, source, scopeSession]);
   const conversationId = `gw_${await sha256Hex(scope)}`;
   const prefix = inputItems(body, protocol).slice(0, turn.index + 1);
   const userId = `gw_user_${await sha256Hex(canonical([scope, protocol, prefix]))}`;
@@ -57,30 +61,29 @@ export async function persistExchange(env: Env, e: GatewayExchange): Promise<voi
     .bind(e.id, e.namespace, e.profile, e.conversationId, e.protocol, e.kind, e.userText, spoken,
       e.model, e.provider, e.httpStatus, e.completion, e.createdAt)];
   // Auxiliary tasks and incomplete outputs never become relationship memories.
+  const added: Array<{ index: number; id: string; content: string }> = [];
   if (e.kind !== "auxiliary") {
     statements.push(env.DB.prepare("INSERT OR IGNORE INTO conversations (id, namespace, created_at, updated_at) VALUES (?, ?, ?, ?)")
       .bind(e.conversationId, e.namespace, e.createdAt, e.createdAt));
-    const addMessage = (id: string, role: string, content: string, seq: number) => statements.push(env.DB.prepare(`INSERT OR IGNORE INTO messages
+    const addMessage = (id: string, role: string, content: string, seq: number) => {
+      added.push({ index: statements.length, id, content });
+      statements.push(env.DB.prepare(`INSERT OR IGNORE INTO messages
       (id, conversation_id, namespace, role, content, source, client_message_hash, upstream_model,
        upstream_provider, request_model, stream, finish_reason, created_at, seq)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .bind(id, e.conversationId, e.namespace, role, content, `gateway:${e.profile}`, id,
         e.model, e.provider, e.profile, e.stream ? 1 : 0, e.completion, e.createdAt, seq));
+    };
     if (e.kind === "human" && e.userText && e.completion !== "truncated") addMessage(e.userId, "user", e.userText, 0);
     if (e.completion === "complete" && spoken) addMessage(`${e.id}:assistant`, "assistant", spoken, 1);
   }
-  await env.DB.batch(statements);
-  if (e.kind !== "auxiliary") {
-    if (e.kind === "human" && e.userText && e.completion !== "truncated") {
-      await upsertMessageFts(env.DB, { namespace: e.namespace, messageId: e.userId, content: e.userText });
-    }
-    if (e.completion === "complete" && spoken) {
-      await upsertMessageFts(env.DB, {
-        namespace: e.namespace,
-        messageId: `${e.id}:assistant`,
-        content: spoken
-      });
-    }
+  const results = await env.DB.batch(statements);
+  // Index only rows this batch actually inserted. An ignored insert means the row (and its
+  // FTS entry) already exists: the user line was usually captured on the request path by
+  // persistHumanUtterance, and queue retries repeat the whole exchange.
+  for (const message of added) {
+    if ((results[message.index]?.meta?.changes ?? 0) === 0) continue;
+    await insertMessageFts(env.DB, { namespace: e.namespace, messageId: message.id, content: message.content });
   }
   if (e.kind === "human" && e.userText && e.completion !== "truncated") {
     try {
@@ -102,6 +105,17 @@ export async function persistExchange(env: Env, e: GatewayExchange): Promise<voi
   }
 }
 
+/**
+ * A finished step with nothing to keep adds no rows. If an earlier try of the same request failed or
+ * was cut off, its row is marked done, as a full write would (a primary-key lookup, no write otherwise).
+ */
+export async function settleExchange(env: Env, e: GatewayExchange): Promise<void> {
+  await env.DB.prepare(`UPDATE gateway_exchanges SET assistant_text = '', upstream_model = ?, upstream_provider = ?,
+      http_status = ?, completion_status = 'complete'
+    WHERE id = ? AND completion_status != 'complete'`)
+    .bind(e.model, e.provider, e.httpStatus, e.id).run();
+}
+
 export async function persistHumanUtterance(
   env: Env,
   e: GatewayExchange
@@ -109,7 +123,7 @@ export async function persistHumanUtterance(
   if (e.kind !== "human" || !e.userText || e.completion === "truncated") {
     return { saved: false, indexed: false, remember: { wrote: false } };
   }
-  await env.DB.batch([
+  const [, inserted] = await env.DB.batch([
     env.DB.prepare("INSERT OR IGNORE INTO conversations (id, namespace, created_at, updated_at) VALUES (?, ?, ?, ?)")
       .bind(e.conversationId, e.namespace, e.createdAt, e.createdAt),
     env.DB.prepare(`INSERT OR IGNORE INTO messages
@@ -119,7 +133,8 @@ export async function persistHumanUtterance(
       .bind(e.userId, e.conversationId, e.namespace, "user", e.userText, `gateway:${e.profile}`, e.userId,
         e.model, e.provider, e.profile, e.stream ? 1 : 0, e.completion, e.createdAt, 0)
   ]);
-  const indexed = await upsertMessageFts(env.DB, {
+  // A client retry of the same turn hits the existing row, which is already indexed.
+  const indexed = (inserted?.meta?.changes ?? 0) > 0 && await insertMessageFts(env.DB, {
     namespace: e.namespace,
     messageId: e.userId,
     content: e.userText
@@ -162,42 +177,73 @@ function coerceToolInput(input: unknown): unknown {
   catch { return trimmed; }
 }
 
+type ToolBuffer = { name: string; json: string; clipped: boolean };
+
+function addArguments(buf: ToolBuffer, piece: string): void {
+  if (!piece || buf.clipped) return;
+  if (buf.json.length + piece.length > TOOL_ARGS_LIMIT) buf.clipped = true;
+  buf.json = (buf.json + piece).slice(0, TOOL_ARGS_LIMIT);
+}
+
 export class OutputCollector {
   text = "";
   complete = false;
   failed = false;
   truncated = false;
+  /** The output outgrew what the gateway buffers, so part of it was never seen. */
+  overflow = false;
+  /** Coding mode only: work tool calls (left out of `text`), and the speech tool calls on their own. */
+  workCalls = 0;
+  spoken = "";
+  spokenTruncated = false;
   model = "";
   private rest = "";
   private decoder = new TextDecoder();
-  private pending = new Map<number, { name: string; json: string }>();
-  private chatTools = new Map<number, { name: string; json: string }>();
+  private pending = new Map<number, ToolBuffer>();
+  private chatTools = new Map<number, ToolBuffer>();
   private sealed = false;
-  constructor(readonly protocol: Protocol) {}
+  /** Coding mode only: code blocks become [code] as the text streams in, before the cap. */
+  private filter: CodeFilter | null;
+  constructor(readonly protocol: Protocol, readonly coding = false) {
+    this.filter = coding ? new CodeFilter(text => this.keep(text)) : null;
+  }
   private append(text: unknown): void {
     if (typeof text !== "string") return;
+    if (this.filter) this.filter.push(text);
+    else this.keep(text);
+  }
+  private keep(text: string): void {
     if (this.text.length + text.length > TEXT_LIMIT) this.truncated = true;
     this.text = (this.text + text).slice(0, TEXT_LIMIT);
   }
-  private appendTool(name: string, input: unknown): void {
-    const line = formatToolCall(name, input);
+  private appendTool(name: string, input: unknown, clipped = false): void {
+    // A coding agent's work tools carry code: count them, never keep their arguments.
+    if (this.coding && !isSpeechTool(String(name || ""))) { this.workCalls += 1; return; }
+    const line = formatToolCall(name, this.coding ? replaceCodeIn(coerceToolInput(input)) : input);
     if (!line) return;
-    if (this.text && !this.text.endsWith("\n")) this.append("\n");
-    this.append(`${line}\n`);
+    if (clipped) { this.truncated = true; if (this.coding) this.spokenTruncated = true; }
+    if (this.coding) {
+      const spoken = this.spoken ? `${this.spoken}\n${line}` : line;
+      if (spoken.length > TEXT_LIMIT) this.spokenTruncated = true;
+      this.spoken = spoken.slice(0, TEXT_LIMIT);
+    }
+    this.filter?.end();
+    if (this.text && !this.text.endsWith("\n")) this.keep("\n");
+    this.keep(`${line}\n`);
   }
   private notePending(index: number, name: string, json = ""): void {
-    const existing = this.pending.get(index) || { name: "", json: "" };
+    const existing = this.pending.get(index) || { name: "", json: "", clipped: false };
     if (name) existing.name = name;
-    if (json) existing.json += json;
+    addArguments(existing, json);
     this.pending.set(index, existing);
   }
   private flushPending(): void {
     for (const [, tool] of [...this.pending.entries()].sort((a, b) => a[0] - b[0])) {
-      this.appendTool(tool.name, tool.json);
+      this.appendTool(tool.name, tool.json, tool.clipped);
     }
     this.pending.clear();
     for (const [, tool] of [...this.chatTools.entries()].sort((a, b) => a[0] - b[0])) {
-      this.appendTool(tool.name, tool.json);
+      this.appendTool(tool.name, tool.json, tool.clipped);
     }
     this.chatTools.clear();
   }
@@ -234,7 +280,7 @@ export class OutputCollector {
     const parsed = splitSseEvents(this.rest + this.decoder.decode(bytes, { stream: true }));
     this.rest = parsed.rest;
     for (const event of parsed.events) this.event(event);
-    if (this.rest.length > 128000) { this.rest = ""; this.truncated = true; }
+    if (this.rest.length > 128000) { this.rest = ""; this.truncated = true; this.overflow = true; }
   }
   private event(event: string): void {
     const raw = getSseData(event);
@@ -249,9 +295,9 @@ export class OutputCollector {
       this.append(c?.delta?.content);
       for (const call of c?.delta?.tool_calls || []) {
         const index = typeof call.index === "number" ? call.index : 0;
-        const buf = this.chatTools.get(index) || { name: "", json: "" };
+        const buf = this.chatTools.get(index) || { name: "", json: "", clipped: false };
         if (call.function?.name) buf.name += call.function.name;
-        if (typeof call.function?.arguments === "string") buf.json += call.function.arguments;
+        if (typeof call.function?.arguments === "string") addArguments(buf, call.function.arguments);
         if (typeof call.name === "string" && !call.function?.name) buf.name += call.name;
         this.chatTools.set(index, buf);
       }
@@ -269,7 +315,7 @@ export class OutputCollector {
       if (data.type === "content_block_stop" && this.pending.has(data.index)) {
         const tool = this.pending.get(data.index)!;
         this.pending.delete(data.index);
-        this.appendTool(tool.name, tool.json);
+        this.appendTool(tool.name, tool.json, tool.clipped);
       }
       if (data.type === "message_delta" && ["max_tokens", "refusal"].includes(data.delta?.stop_reason)) this.failed = true;
       if (data.type === "message_stop") this.complete = !this.failed;
@@ -284,10 +330,15 @@ export class OutputCollector {
           typeof data.item.arguments === "string" ? data.item.arguments : "");
       }
       if (["response.completed", "response.incomplete", "response.failed"].includes(data.type)) {
+        this.filter?.end();
         const streamed = this.text;
         this.pending.clear();
         this.text = "";
+        this.workCalls = 0;
+        this.spoken = "";
+        this.spokenTruncated = false;
         this.json(data.response);
+        this.filter?.end();
         if (!this.text) this.text = streamed;
       }
     }
@@ -297,17 +348,19 @@ export class OutputCollector {
     if (this.rest.trim()) this.event(this.rest);
     this.rest = "";
     this.flushPending();
+    this.filter?.end();
     if (this.sealed) return;
     this.sealed = true;
     this.text = cleanMessageText(this.text);
+    this.spoken = cleanMessageText(this.spoken);
   }
 }
 
 export function observeResponse(upstream: Response, protocol: Protocol, ctx: ExecutionContext,
-  onFinish: (collector: OutputCollector, interrupted: boolean) => Promise<void>): Response {
+  onFinish: (collector: OutputCollector, interrupted: boolean) => Promise<void>, coding = false): Response {
   if (!upstream.body) return upstream;
   const reader = upstream.body.getReader();
-  const collector = new OutputCollector(protocol);
+  const collector = new OutputCollector(protocol, coding);
   const sse = upstream.headers.get("content-type")?.includes("text/event-stream");
   const decoder = new TextDecoder();
   let json = "";
@@ -334,7 +387,7 @@ export function observeResponse(upstream: Response, protocol: Protocol, ctx: Exe
           if (sse) collector.chunk(item.value);
           else if (!collector.truncated) {
             json += decoder.decode(item.value, { stream: true });
-            if (json.length > 256000) { collector.truncated = true; json = ""; }
+            if (json.length > 256000) { collector.truncated = true; collector.overflow = true; json = ""; }
           }
         } catch { collector.failed = true; }
         controller.enqueue(item.value);

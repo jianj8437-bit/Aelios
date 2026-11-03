@@ -22,6 +22,8 @@ export interface CreatePreciousInput {
   content: string;
   contextMessageIds?: string[];
   source?: string;
+  /** 导入时带着原来的时间；不传就是现在。 */
+  createdAt?: string | null;
 }
 
 export async function createPrecious(db: D1Database, input: CreatePreciousInput): Promise<PreciousRow> {
@@ -34,7 +36,7 @@ export async function createPrecious(db: D1Database, input: CreatePreciousInput)
     context_message_ids: JSON.stringify(input.contextMessageIds ?? []),
     source: input.source ?? "human",
     pinned: 1,
-    created_at: now,
+    created_at: input.createdAt || now,
     last_injected_at: null
   };
 

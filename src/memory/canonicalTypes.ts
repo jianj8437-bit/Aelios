@@ -29,3 +29,21 @@ export function clampMemoryType(
   if (trimmed && CANONICAL_SET.has(trimmed)) return trimmed as CanonicalMemoryType;
   return fallback;
 }
+
+/** 世界知识（后台「世界知识」页）。不在 8 类里，只有明说要存世界知识的写入才写得成它。 */
+export const WORLD_FACT_TYPE = "world_fact";
+
+/**
+ * 新写入的 type：照 clampMemoryType 收进 8 类；allowWorldFact 时 world_fact 原样保留。
+ * 目前放行的只有 MCP remember 明写 type=world_fact、改写一条世界知识时沿用它的类型、
+ * 和 dream 直接更新世界知识；抽取器、候选审核、REST 新建、导入照旧只认 8 类。
+ * (后台 PATCH /v1/memory/:id 改 type 本来就不过这里，原样写。)
+ */
+export function storedMemoryType(
+  type: string | null | undefined,
+  fallback: CanonicalMemoryType = "fact",
+  allowWorldFact = false
+): string {
+  if (allowWorldFact && (type || "").trim().toLowerCase() === WORLD_FACT_TYPE) return WORLD_FACT_TYPE;
+  return clampMemoryType(type, fallback);
+}
